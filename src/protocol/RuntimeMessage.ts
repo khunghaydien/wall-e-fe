@@ -15,17 +15,20 @@ export type ControlAction =
   | "session_stopped"
   | "call"
   | "stop"
+  | "interrupt"
   | "audio_received"
   | "tts_started"
   | "tts_finished"
+  | "thinking"
+  | "metrics"
   | "error";
 
 export type ControlMessage = {
   type: "control";
   action: ControlAction;
   message?: string;
-  /** User utterance caption sent with call. */
   text?: string;
+  metrics?: Record<string, number | undefined>;
 };
 
 export type TranscriptMessage = {
@@ -93,7 +96,11 @@ export function int16ToBase64(pcm: Int16Array): string {
 
 export function base64ToInt16(data: string): Int16Array {
   const bytes = base64ToBytes(data);
-  return new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+  return new Int16Array(
+    bytes.buffer,
+    bytes.byteOffset,
+    Math.floor(bytes.byteLength / 2),
+  );
 }
 
 export function base64ToBytes(data: string): Uint8Array {

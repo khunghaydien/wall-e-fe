@@ -4,7 +4,10 @@ export type ChatMessage = {
   id: string;
   role: ChatRole;
   text: string;
+  /** Still streaming / interim caption. */
   pending?: boolean;
+  /** Provisional (interim) caption — render lighter than final. */
+  interim?: boolean;
 };
 
 let messageSeq = 0;

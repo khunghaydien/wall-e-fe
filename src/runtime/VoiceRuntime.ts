@@ -5,9 +5,10 @@ import {
 import {
   BrowserCaption,
   Microphone,
-  UtteranceDetector,
   isMeaningfulCaption,
+  looksLikeAssistantEcho,
   rootMeanSquare,
+  stripAssistantEcho,
 } from "@/hearing";
 import { base64ToBytes } from "@/protocol";
 import { SpeakerPlayer } from "@/speaking";
@@ -25,9 +26,34 @@ import { EventBus } from "./EventBus";
 import type { RuntimeEvents } from "./RuntimeEvents";
 import { RuntimeState } from "./RuntimeState";
 
+/** After local playback is truly idle, short settle before opening caption. */
+const ECHO_AFTER_IDLE_MS = 1_000;
+/** Text filter window after reopen (tail-of-reply bleed). */
+const ECHO_GUARD_MS = 4_000;
+const SPEAKER_IDLE_TIMEOUT_MS = 30_000;
+/** Local silence after last NEW caption → force dispatch (don't stay in listening). */
+const LOCAL_EOS_MS = 1_200;
+/** If preparing/speaking stalls with no progress, force listen again. */
+const STUCK_PREPARING_MS = 12_000;
+const STUCK_SPEAKING_MS = 20_000;
+
+export type TurnPhase =
+  | "listening"
+  | "thinking"
+  | "preparing"
+  | "speaking"
+  | "echo_hold";
+
 /**
- * Mic → caption idle ~1.2s → auto call → backend speech → Speaker.
- * End-of-turn uses caption gap, not mic level → 0.
+ * Stream + revise turn-taking:
+ * - listening: caption on, hear user.
+ * - thinking: caption STAYS on — if user keeps talking → revise (abort mid-reply).
+ * - preparing: TTS synthesizing / audio in flight — caption off.
+ * - speaking: audio is queued/playing — caption off.
+ * - echo_hold: caption off until room reverb dies, then listen again.
+ * - After true EOS: answer once with the merged utterance.
+ *
+ * Mic is never played to the speaker (user never hears themselves).
  */
 export class VoiceRuntime {
   readonly events = new EventBus<RuntimeEvents>();
@@ -40,13 +66,20 @@ export class VoiceRuntime {
   private readonly caption = new BrowserCaption();
   private readonly transport = new TransportClient();
   private readonly speaker = new SpeakerPlayer();
-  private readonly utterance = new UtteranceDetector();
 
   private started = false;
   private bound = false;
-  /** False while waiting for / playing AI response. */
-  private acceptingSpeech = true;
+  private gate: TurnPhase = "listening";
   private levelEmitAt = 0;
+  private listenEpoch = 0;
+  private lastAssistantText = "";
+  private echoGuardUntil = 0;
+  /** Seed utterance that triggered the in-flight AI turn (for revise). */
+  private dispatchedSeed = "";
+  private stuckTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastAudioAt = 0;
+  private eosTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastEosCaption = "";
 
   async start(): Promise<void> {
     if (this.started) return;
@@ -62,7 +95,6 @@ export class VoiceRuntime {
       this.setTts(TtsStatus.Connecting);
 
       await this.transport.connect();
-      // Unlock speaker AudioContext on the same user gesture as Start.
       await this.speaker.enqueue({
         pcm: new Int16Array(160),
         sampleRate: AUDIO_SAMPLE_RATE,
@@ -74,14 +106,8 @@ export class VoiceRuntime {
       this.setTts(TtsStatus.Idle);
 
       await this.mic.start();
-      try {
-        if (this.caption.supported) this.caption.start("vi-VN");
-      } catch {
-        // Captions are optional — audio path must keep working.
-      }
+      this.openListening();
 
-      this.utterance.reset();
-      this.acceptingSpeech = true;
       this.setMic(MicStatus.Capturing);
       this.setRuntime(RuntimeStatus.Running);
     } catch (error) {
@@ -95,15 +121,58 @@ export class VoiceRuntime {
     }
   }
 
-  /** Manual trigger kept for debugging; normal path is auto after silence. */
   call(): void {
-    this.beginAssistantTurn();
+    this.finishListeningTurn();
+  }
+
+  /** Caption went quiet → leave listening and ask the backend to answer. */
+  private finishListeningTurn(): void {
+    this.clearEosTimer();
+    if (!this.started || !this.transport.isOpen) return;
+    if (this.gate !== "listening") return;
+
+    const caption = (
+      this.state.get().finalTranscript ||
+      this.state.get().partialTranscript
+    ).trim();
+    if (!isMeaningfulCaption(caption)) return;
+
+    this.dispatchedSeed = caption;
+    this.lastEosCaption = "";
+    this.setGate("thinking");
+    this.transport.call(caption);
+  }
+
+  private clearEosTimer(): void {
+    if (this.eosTimer) {
+      clearTimeout(this.eosTimer);
+      this.eosTimer = null;
+    }
+  }
+
+  /**
+   * Arm local end-of-speech. Only resets when caption text changes so repeated
+   * identical Web Speech events cannot keep us in listening forever.
+   */
+  private noteListeningCaption(text: string): void {
+    if (this.gate !== "listening") return;
+    const normalized = text.trim();
+    if (!normalized || !isMeaningfulCaption(normalized)) return;
+    if (normalized === this.lastEosCaption) return;
+
+    this.lastEosCaption = normalized;
+    this.clearEosTimer();
+    this.eosTimer = setTimeout(() => {
+      this.eosTimer = null;
+      this.finishListeningTurn();
+    }, LOCAL_EOS_MS);
   }
 
   async stop(): Promise<void> {
     if (!this.started && this.state.get().runtime === RuntimeStatus.Idle) return;
 
     this.setRuntime(RuntimeStatus.Stopping);
+    this.listenEpoch += 1;
     this.transport.stop();
     await this.teardown();
     this.state.reset();
@@ -111,54 +180,204 @@ export class VoiceRuntime {
     this.setRuntime(RuntimeStatus.Idle);
   }
 
-  private beginAssistantTurn(): void {
-    if (!this.started || !this.transport.isOpen) return;
-    if (!this.acceptingSpeech) return;
+  private startCaption(): void {
+    try {
+      if (this.started && this.caption.supported) {
+        this.caption.start("vi-VN");
+      }
+    } catch {
+      // optional
+    }
+  }
 
-    const caption =
-      this.utterance.lastText ||
-      this.state.get().partialTranscript ||
-      this.state.get().finalTranscript;
+  private stopCaption(): void {
+    this.caption.stop();
+    this.state.setPartialTranscript("");
+  }
 
-    // Hard gate: noise / no caption / meaningless crumbs → stay listening.
-    if (!isMeaningfulCaption(caption)) {
-      this.utterance.reset();
-      return;
+  private setGate(phase: TurnPhase): void {
+    this.gate = phase;
+    this.state.setTurnPhase(phase);
+    this.events.emit("runtime:turn", phase);
+    if (phase !== "listening") {
+      this.clearEosTimer();
+    }
+    this.armStuckWatchdog(phase);
+  }
+
+  private clearStuckWatchdog(): void {
+    if (this.stuckTimer) {
+      clearTimeout(this.stuckTimer);
+      this.stuckTimer = null;
+    }
+  }
+
+  /** Recover if TTS hangs and tts_finished never arrives. */
+  private armStuckWatchdog(phase: TurnPhase): void {
+    this.clearStuckWatchdog();
+    if (phase !== "preparing" && phase !== "speaking") return;
+
+    const waitMs = phase === "preparing" ? STUCK_PREPARING_MS : STUCK_SPEAKING_MS;
+    const epoch = this.listenEpoch;
+    this.stuckTimer = setTimeout(() => {
+      if (!this.started || epoch !== this.listenEpoch) return;
+      if (this.gate !== "preparing" && this.gate !== "speaking") return;
+      // Speaking with recent audio is fine — only bail if truly idle/stuck.
+      if (
+        this.gate === "speaking" &&
+        (this.speaker.isPlaying || performance.now() - this.lastAudioAt < 3_000)
+      ) {
+        this.armStuckWatchdog("speaking");
+        return;
+      }
+      console.warn(`[runtime] stuck in ${this.gate} — forcing listen`);
+      this.speaker.flush();
+      this.setTts(TtsStatus.Idle);
+      this.setSpeaking(SpeakingStatus.Idle);
+      this.state.setThinking(false);
+      void this.resumeListeningAfterEcho();
+    }, waitMs);
+  }
+
+  private openListening(): void {
+    this.clearEosTimer();
+    this.lastEosCaption = "";
+    this.setGate("listening");
+    this.dispatchedSeed = "";
+    this.state.setPartialTranscript("");
+    this.state.setFinalTranscript("");
+    this.startCaption();
+  }
+
+  private async resumeListeningAfterEcho(): Promise<void> {
+    const epoch = ++this.listenEpoch;
+    this.setGate("echo_hold");
+    this.stopCaption();
+
+    // Gate on real playback end (not a fixed "wait N seconds while speaking").
+    await Promise.race([
+      this.speaker.whenIdle(),
+      sleep(SPEAKER_IDLE_TIMEOUT_MS),
+    ]);
+    // Brief settle after the speaker actually stopped.
+    await sleep(ECHO_AFTER_IDLE_MS);
+
+    if (!this.started || epoch !== this.listenEpoch) return;
+
+    this.state.setPartialTranscript("");
+    this.state.setFinalTranscript("");
+    this.echoGuardUntil = performance.now() + ECHO_GUARD_MS;
+    this.openListening();
+  }
+
+  private resumeListeningForRevise(merged: string): void {
+    this.listenEpoch += 1;
+    this.speaker.flush();
+    this.setGate("listening");
+    this.dispatchedSeed = "";
+    this.lastAssistantText = "";
+    this.echoGuardUntil = 0;
+    this.state.setThinking(false);
+    const clean = merged.trim();
+    this.state.setFinalTranscript(clean);
+    this.state.setPartialTranscript("");
+    if (!this.caption.isActive) {
+      this.startCaption();
+    }
+    this.events.emit("runtime:revise", { text: clean });
+    this.events.emit("stt:transcript", { text: clean, isFinal: true });
+  }
+
+  private acceptCaption(raw: string): string | null {
+    // Caption is stopped while preparing/speaking / echo_hold; still hard-gate.
+    if (
+      this.gate === "echo_hold" ||
+      this.gate === "speaking" ||
+      this.gate === "preparing"
+    ) {
+      return null;
     }
 
-    this.acceptingSpeech = false;
-    this.utterance.reset();
-    this.state.clearAssistantText();
-    this.setLlm(LlmStatus.Streaming);
-    this.caption.stop();
-    this.transport.call(caption);
+    let text = raw.trim();
+    if (!text) return null;
+
+    // After TTS: drop speaker→mic bleed (often only the last clause, ASR-garbled).
+    if (
+      this.gate === "listening" &&
+      performance.now() < this.echoGuardUntil &&
+      this.lastAssistantText
+    ) {
+      if (looksLikeAssistantEcho(text, this.lastAssistantText)) {
+        return null;
+      }
+      text = stripAssistantEcho(text, this.lastAssistantText);
+      if (!text || looksLikeAssistantEcho(text, this.lastAssistantText)) {
+        return null;
+      }
+    }
+
+    if (!isMeaningfulCaption(text)) return null;
+    return text;
+  }
+
+  /** Kill Web Speech so Mac speaker audio cannot become captions. */
+  private silenceCaptionForTts(): void {
+    this.stopCaption();
   }
 
   private bindOnce(): void {
     if (this.bound) return;
     this.bound = true;
 
-    this.caption.onCaption((text, isFinal) => {
-      if (!this.acceptingSpeech) return;
+    this.caption.onCaption((raw, isFinal) => {
+      if (
+        this.gate === "echo_hold" ||
+        this.gate === "speaking" ||
+        this.gate === "preparing"
+      ) {
+        return;
+      }
 
-      // Ignore noise hallucinations like "Phẩy. Phẩy." entirely.
-      if (!isMeaningfulCaption(text)) return;
+      const text = this.acceptCaption(raw);
+      if (!text) return;
 
-      this.utterance.noteCaption(text);
+      // Thinking (pre-TTS): only forward if user ADDED words (revise path).
+      // Speaking keeps caption off — Mac speaker bleed would look like revise.
+      if (this.gate === "thinking") {
+        const seed =
+          this.dispatchedSeed ||
+          this.state.get().finalTranscript ||
+          this.state.get().partialTranscript;
+        if (!addsNewSpeechLocal(seed, text)) return;
+
+        this.transport.sendTranscript(text, isFinal);
+
+        const merged = mergeLocal(seed, text);
+        this.state.setFinalTranscript(merged);
+        this.state.setPartialTranscript(isFinal ? "" : text);
+        this.events.emit("stt:transcript", {
+          text: merged,
+          isFinal,
+        });
+        return;
+      }
+
+      if (this.gate !== "listening") return;
+
+      this.transport.sendTranscript(text, isFinal);
 
       if (isFinal) {
         const previous = this.state.get().finalTranscript;
-        const merged = previous ? `${previous} ${text}`.trim() : text;
+        const merged = previous ? mergeLocal(previous, text) : text;
+        if (!isMeaningfulCaption(merged)) return;
         this.state.setFinalTranscript(merged);
         this.state.setPartialTranscript("");
         this.events.emit("stt:transcript", { text: merged, isFinal: true });
+        this.noteListeningCaption(merged);
       } else {
         this.state.setPartialTranscript(text);
         this.events.emit("stt:transcript", { text, isFinal: false });
-      }
-
-      if (this.utterance.tick()) {
-        this.beginAssistantTurn();
+        this.noteListeningCaption(text);
       }
     });
 
@@ -173,59 +392,131 @@ export class VoiceRuntime {
         this.events.emit("mic:level", level);
       }
 
-      if (!this.acceptingSpeech) return;
-
+      // Never play mic to speaker. Only send PCM while listening (VAD/EOS).
+      if (this.gate !== "listening") return;
       this.transport.sendAudio(float32ToInt16(frame.samples));
-
-      // End turn when caption has been idle — ignore mic floor noise.
-      if (this.utterance.tick(now)) {
-        this.beginAssistantTurn();
-      }
     });
 
     this.transport.setHandler({
-      transcript: () => undefined,
+      transcript: (message) => {
+        if (!message.isFinal || !message.text.trim()) return;
+        if (this.gate === "echo_hold") return;
+        const cleaned = message.text.trim();
+        if (!isMeaningfulCaption(cleaned)) return;
+        this.events.emit("stt:transcript", { text: cleaned, isFinal: true });
+      },
       ai: (message) => {
         if (message.phase === "started") {
+          this.setGate("thinking");
+          this.lastAssistantText = "";
+          if (!this.dispatchedSeed) {
+            this.dispatchedSeed =
+              this.state.get().finalTranscript ||
+              this.state.get().partialTranscript;
+          }
+          // Keep caption on for revise.
+          if (!this.caption.isActive) this.startCaption();
           this.setLlm(LlmStatus.Streaming);
-          this.state.clearAssistantText();
           return;
         }
         if (message.phase === "delta" && message.delta) {
-          this.state.appendAssistantText(message.delta);
+          this.lastAssistantText += message.delta;
+          this.state.setThinking(false);
+          this.events.emit("runtime:thinking", {
+            thinking: false,
+            message: "",
+          });
           this.events.emit("llm:token", { text: message.delta, done: false });
           return;
         }
         if (message.phase === "done") {
           this.events.emit("llm:token", { text: "", done: true });
           this.setLlm(LlmStatus.Idle);
+          // Text is complete — Edge TTS may still be synthesizing the first phrase.
+          if (this.gate === "thinking") {
+            this.setGate("preparing");
+            this.silenceCaptionForTts();
+            this.setSpeaking(SpeakingStatus.Buffering);
+            this.setTts(TtsStatus.Streaming);
+          }
         }
       },
       control: (message) => {
         switch (message.action) {
+          case "thinking":
+            this.setGate("thinking");
+            if (!this.dispatchedSeed) {
+              this.dispatchedSeed =
+                this.state.get().finalTranscript ||
+                this.state.get().partialTranscript;
+            }
+            if (!this.caption.isActive) this.startCaption();
+            this.state.setThinking(true, message.message);
+            this.setLlm(LlmStatus.Streaming);
+            this.events.emit("runtime:thinking", {
+              thinking: true,
+              message: message.message ?? "Đang nghĩ...",
+            });
+            break;
           case "tts_started":
+            // Audio may already have arrived (sent first). Don't downgrade.
+            if (this.gate !== "speaking") {
+              this.setGate("preparing");
+            }
+            this.silenceCaptionForTts();
             this.setTts(TtsStatus.Streaming);
-            this.setSpeaking(SpeakingStatus.Buffering);
+            if (this.gate !== "speaking") {
+              this.setSpeaking(SpeakingStatus.Buffering);
+            }
             break;
           case "tts_finished":
+            this.clearStuckWatchdog();
             this.setTts(TtsStatus.Idle);
+            this.state.setThinking(false);
+            this.events.emit("runtime:thinking", {
+              thinking: false,
+              message: "",
+            });
+            void this.resumeListeningAfterEcho().then(() => {
+              this.setSpeaking(SpeakingStatus.Idle);
+            });
+            break;
+          case "interrupt": {
+            const isRevise = message.message === "revise";
+            this.speaker.flush();
+            this.state.setThinking(false);
             this.setSpeaking(SpeakingStatus.Idle);
-            this.acceptingSpeech = true;
-            this.utterance.reset();
-            try {
-              if (this.started && this.caption.supported) {
-                this.caption.start("vi-VN");
-              }
-            } catch {
-              // optional
+            this.setTts(TtsStatus.Idle);
+            this.setLlm(LlmStatus.Idle);
+            this.events.emit("runtime:thinking", {
+              thinking: false,
+              message: "",
+            });
+
+            if (isRevise) {
+              const merged =
+                this.state.get().finalTranscript ||
+                this.state.get().partialTranscript;
+              const clean = this.lastAssistantText
+                ? stripAssistantEcho(merged, this.lastAssistantText)
+                : merged;
+              this.resumeListeningForRevise(clean);
+            } else {
+              void this.resumeListeningAfterEcho();
             }
+            break;
+          }
+          case "metrics":
+            this.state.setMetrics(message.metrics ?? null);
+            this.events.emit("runtime:metrics", message.metrics ?? null);
             break;
           case "error": {
             const err = new Error(message.message ?? "Voice runtime error");
             this.state.setError(err);
             this.events.emit("runtime:error", err);
             this.setRuntime(RuntimeStatus.Error);
-            this.acceptingSpeech = true;
+            this.state.setThinking(false);
+            void this.resumeListeningAfterEcho();
             break;
           }
           default:
@@ -233,21 +524,45 @@ export class VoiceRuntime {
         }
       },
       audio: async (message) => {
+        // First audible frame — this is when "AI đang nói" should appear.
+        this.lastAudioAt = performance.now();
+        if (this.gate !== "speaking") {
+          this.setGate("speaking");
+          this.state.setThinking(false);
+          this.events.emit("runtime:thinking", {
+            thinking: false,
+            message: "",
+          });
+        } else {
+          // Refresh watchdog while audio keeps arriving.
+          this.armStuckWatchdog("speaking");
+        }
+        this.silenceCaptionForTts();
         this.setSpeaking(SpeakingStatus.Playing);
-        await this.speaker.enqueueEncoded({
-          codec: message.codec,
-          data: base64ToBytes(message.data),
-          sampleRate: message.sampleRate,
-          timestamp: message.timestamp,
-        });
+        this.setTts(TtsStatus.Streaming);
+        try {
+          await this.speaker.enqueueEncoded({
+            codec: message.codec,
+            data: base64ToBytes(message.data),
+            sampleRate: message.sampleRate,
+            timestamp: message.timestamp,
+          });
+        } catch (error) {
+          console.error("[speaker] enqueue failed", error);
+        }
       },
     });
   }
 
   private async teardown(): Promise<void> {
-    this.caption.stop();
-    this.utterance.reset();
-    this.acceptingSpeech = true;
+    this.clearStuckWatchdog();
+    this.clearEosTimer();
+    this.stopCaption();
+    this.setGate("listening");
+    this.lastAssistantText = "";
+    this.echoGuardUntil = 0;
+    this.dispatchedSeed = "";
+    this.lastEosCaption = "";
     await Promise.allSettled([
       this.mic.stop(),
       Promise.resolve(this.transport.disconnect()),
@@ -284,4 +599,43 @@ export class VoiceRuntime {
     this.state.setSpeaking(status);
     this.events.emit("speaking:status", status);
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function mergeLocal(prev: string, next: string): string {
+  const a = prev.trim();
+  const b = next.trim();
+  if (!a) return b;
+  if (!b) return a;
+  if (b.startsWith(a)) return b;
+  if (a.includes(b)) return a;
+  if (b.includes(a)) return b;
+  return `${a} ${b}`.trim();
+}
+
+function addsNewSpeechLocal(seed: string, next: string): boolean {
+  const a = seed
+    .toLocaleLowerCase("vi")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const b = next
+    .toLocaleLowerCase("vi")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!b) return false;
+  if (!a) return true;
+  if (a === b || a.includes(b)) return false;
+  if (b.startsWith(a) && b.length > a.length + 2) return true;
+  const aWords = new Set(a.match(/\p{L}+/gu) ?? []);
+  const bWords = b.match(/\p{L}+/gu) ?? [];
+  let novel = 0;
+  for (const w of bWords) {
+    if (!aWords.has(w)) novel += 1;
+  }
+  return novel >= 2 || (novel >= 1 && b.length > a.length + 5);
 }

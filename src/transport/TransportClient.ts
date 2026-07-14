@@ -22,6 +22,8 @@ export class TransportClient {
   private socket: StreamSocket | null = null;
   private handler: RuntimeMessageHandler | null = null;
   private sequence = 0;
+  /** Keep WS handlers ordered so audio is queued before tts_finished/whenIdle. */
+  private inbound: Promise<void> = Promise.resolve();
 
   setHandler(handler: RuntimeMessageHandler): void {
     this.handler = handler;
@@ -33,7 +35,13 @@ export class TransportClient {
       if (typeof data !== "string") return;
       const message = parseRuntimeMessage(data);
       if (!message || !this.handler) return;
-      void dispatchRuntimeMessage(message, this.handler);
+      const handler = this.handler;
+      this.inbound = this.inbound
+        .then(() => dispatchRuntimeMessage(message, handler))
+        .then(() => undefined)
+        .catch((error) => {
+          console.error("[transport] inbound handler failed", error);
+        });
     });
     await this.socket.connect();
   }
@@ -52,11 +60,26 @@ export class TransportClient {
     this.send(message);
   }
 
+  sendTranscript(text: string, isFinal: boolean): void {
+    this.send({
+      type: "transcript",
+      text,
+      isFinal,
+    });
+  }
+
   call(text?: string): void {
     this.send({
       type: "control",
       action: "call",
       text,
+    } satisfies ControlMessage);
+  }
+
+  interrupt(): void {
+    this.send({
+      type: "control",
+      action: "interrupt",
     } satisfies ControlMessage);
   }
 
@@ -68,6 +91,7 @@ export class TransportClient {
     this.socket?.close();
     this.socket = null;
     this.sequence = 0;
+    this.inbound = Promise.resolve();
   }
 
   get isOpen(): boolean {

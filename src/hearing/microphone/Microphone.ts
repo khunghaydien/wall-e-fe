@@ -5,6 +5,11 @@ export type MicrophoneOptions = {
   channelCount: number;
 };
 
+/**
+ * FE WebRTC Processing stage (first step of the hearing chain):
+ * getUserMedia echoCancellation + noiseSuppression + autoGainControl.
+ * Server HearingEngine continues: Preprocessor → DeepFilter → Level → VAD → STT.
+ */
 export class Microphone {
   private stream: MediaStream | null = null;
   private context: AudioContext | null = null;
@@ -25,6 +30,7 @@ export class Microphone {
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: this.options.channelCount,
+        sampleRate: this.options.sampleRate,
         echoCancellation: true,
         noiseSuppression: true,
         autoGainControl: true,
@@ -32,8 +38,7 @@ export class Microphone {
       video: false,
     });
 
-    this.context = new AudioContext();
-    // Critical: browsers start AudioContext suspended until resumed after a gesture.
+    this.context = new AudioContext({ sampleRate: this.options.sampleRate });
     if (this.context.state === "suspended") {
       await this.context.resume();
     }

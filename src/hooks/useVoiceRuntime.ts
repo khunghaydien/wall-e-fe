@@ -35,7 +35,6 @@ export function useVoiceRuntime() {
       runtime.events.on("llm:status", (llm) => {
         runtimeStore.setState({ llm });
         if (llm === LlmStatus.Streaming) {
-          // Chốt bubble user; chưa tạo bubble WALL-E cho đến khi có token.
           const draft =
             runtimeStore.getState().partialTranscript ||
             runtimeStore.getState().finalTranscript;
@@ -50,9 +49,38 @@ export function useVoiceRuntime() {
       runtime.events.on("speaking:status", (speaking) => {
         runtimeStore.setState({ speaking });
       }),
+      runtime.events.on("runtime:turn", (turnPhase) => {
+        runtimeStore.setState({ turnPhase });
+      }),
+      runtime.events.on("runtime:thinking", ({ thinking, message }) => {
+        runtimeStore.setState({
+          thinking,
+          thinkingMessage: message,
+        });
+        if (thinking) {
+          const draft =
+            runtimeStore.getState().partialTranscript ||
+            runtimeStore.getState().finalTranscript;
+          if (draft.trim()) {
+            runtimeStore.commitUserMessage(draft.trim());
+          }
+        }
+      }),
+      runtime.events.on("runtime:metrics", (metrics) => {
+        runtimeStore.setState({ metrics });
+      }),
+      runtime.events.on("runtime:revise", ({ text }) => {
+        runtimeStore.reviseUserMessage(text);
+      }),
       runtime.events.on("stt:transcript", (event) => {
         if (event.isFinal) {
-          runtimeStore.commitUserMessage(event.text);
+          // During revise, keep user bubble open (pending) until true EOS reply.
+          const last = runtimeStore.getState().messages.at(-1);
+          if (last?.role === "user" && last.pending) {
+            runtimeStore.reviseUserMessage(event.text);
+          } else {
+            runtimeStore.commitUserMessage(event.text);
+          }
         } else {
           runtimeStore.upsertUserDraft(event.text);
         }
@@ -83,11 +111,14 @@ export function useVoiceRuntime() {
     setIsBusy(true);
     try {
       runtimeStore.setState({
-        assistantText: "",
         partialTranscript: "",
         finalTranscript: "",
         messages: [],
         micLevel: 0,
+        thinking: false,
+        thinkingMessage: "",
+        turnPhase: "listening",
+        metrics: null,
         error: null,
       });
       await runtimeRef.current.start();

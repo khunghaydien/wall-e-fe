@@ -7,6 +7,9 @@ import {
   TtsStatus,
 } from "@/enums";
 import type { ChatMessage } from "@/types";
+import type { TurnPhase } from "./VoiceRuntime";
+
+export type LatencyMetrics = Record<string, number | undefined>;
 
 export type RuntimeStateSnapshot = {
   runtime: RuntimeStatus;
@@ -15,10 +18,13 @@ export type RuntimeStateSnapshot = {
   llm: LlmStatus;
   tts: TtsStatus;
   speaking: SpeakingStatus;
+  turnPhase: TurnPhase;
   micLevel: number;
   partialTranscript: string;
   finalTranscript: string;
-  assistantText: string;
+  thinking: boolean;
+  thinkingMessage: string;
+  metrics: LatencyMetrics | null;
   messages: ChatMessage[];
   error: Error | null;
 };
@@ -57,6 +63,10 @@ export class RuntimeState {
     this.snapshot.speaking = status;
   }
 
+  setTurnPhase(phase: TurnPhase): void {
+    this.snapshot.turnPhase = phase;
+  }
+
   setMicLevel(level: number): void {
     this.snapshot.micLevel = level;
   }
@@ -69,12 +79,15 @@ export class RuntimeState {
     this.snapshot.finalTranscript = text;
   }
 
-  appendAssistantText(text: string): void {
-    this.snapshot.assistantText += text;
+  setThinking(thinking: boolean, message = ""): void {
+    this.snapshot.thinking = thinking;
+    this.snapshot.thinkingMessage = thinking
+      ? message || "Đang nghĩ câu trả lời..."
+      : "";
   }
 
-  clearAssistantText(): void {
-    this.snapshot.assistantText = "";
+  setMetrics(metrics: LatencyMetrics | null): void {
+    this.snapshot.metrics = metrics;
   }
 
   setError(error: Error | null): void {
@@ -94,10 +107,13 @@ function createInitialSnapshot(): RuntimeStateSnapshot {
     llm: LlmStatus.Idle,
     tts: TtsStatus.Idle,
     speaking: SpeakingStatus.Idle,
+    turnPhase: "listening",
     micLevel: 0,
     partialTranscript: "",
     finalTranscript: "",
-    assistantText: "",
+    thinking: false,
+    thinkingMessage: "",
+    metrics: null,
     messages: [],
     error: null,
   };

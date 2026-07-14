@@ -15,7 +15,7 @@ export default function Home() {
     const el = listRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [state.messages]);
+  }, [state.messages, state.thinking]);
 
   return (
     <main className="flex min-h-screen w-full items-center justify-center px-6 py-10">
@@ -28,7 +28,9 @@ export default function Home() {
             Voice Runtime
           </h1>
           <p className="text-muted text-sm leading-relaxed">
-            Bạn bên phải · WALL-E bên trái · chỉ mở bubble mới khi có trả lời
+            Nói liên tục — nếu AI chen sớm (trước khi nói) sẽ abort, gộp câu bạn,
+            rồi trả lời một lần. Lúc AI đang phát loa thì tắt caption để tránh
+            nghe tiếng loa.
           </p>
         </header>
 
@@ -38,6 +40,14 @@ export default function Home() {
               Status
             </p>
             <div className="flex flex-1 flex-col justify-center gap-4">
+              <div className="rounded-lg border border-border/80 bg-background/40 px-3 py-3">
+                <p className="text-muted text-[10px] uppercase tracking-wide">
+                  Lượt hiện tại
+                </p>
+                <p className="mt-1 text-base font-medium text-accent">
+                  {turnLabel(state.turnPhase)}
+                </p>
+              </div>
               <StatusRow label="Runtime" value={state.runtime} />
               <StatusRow label="Mic" value={state.mic} />
               <div className="space-y-1.5">
@@ -53,6 +63,21 @@ export default function Home() {
                 </div>
               </div>
               <StatusRow label="Speaker" value={state.speaking} />
+              {state.metrics ? (
+                <div className="space-y-1 border-t border-border pt-3 text-xs text-muted">
+                  <p className="uppercase tracking-wide">Latency</p>
+                  <LatencyRow
+                    label="GPT first"
+                    ms={state.metrics.gptFirstTokenMs}
+                  />
+                  <LatencyRow label="GPT done" ms={state.metrics.gptDoneMs} />
+                  <LatencyRow
+                    label="TTS first"
+                    ms={state.metrics.ttsFirstAudioMs}
+                  />
+                  <LatencyRow label="TTS done" ms={state.metrics.ttsDoneMs} />
+                </div>
+              ) : null}
             </div>
           </section>
 
@@ -66,14 +91,23 @@ export default function Home() {
               ref={listRef}
               className="flex flex-1 flex-col gap-2.5 overflow-y-auto px-3 py-4"
             >
-              {state.messages.length === 0 ? (
+              {state.messages.length === 0 && !state.thinking ? (
                 <p className="px-2 text-sm text-muted">
                   Start rồi nói — tin nhắn sẽ hiện ở đây.
                 </p>
               ) : (
-                state.messages.map((message) => (
-                  <ChatBubble key={message.id} message={message} />
-                ))
+                <>
+                  {state.messages.map((message) => (
+                    <ChatBubble key={message.id} message={message} />
+                  ))}
+                  {state.thinking ? (
+                    <div className="flex justify-start">
+                      <div className="max-w-[85%] rounded-2xl rounded-bl-md bg-[#243040]/80 px-3.5 py-2 text-sm text-muted italic">
+                        {state.thinkingMessage || "WALL-E đang suy nghĩ..."}
+                      </div>
+                    </div>
+                  ) : null}
+                </>
               )}
             </div>
             {state.error ? (
@@ -109,6 +143,7 @@ export default function Home() {
 
 function ChatBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user";
+  const dim = Boolean(message.interim || (message.pending && isUser));
 
   return (
     <div
@@ -119,7 +154,7 @@ function ChatBubble({ message }: { message: ChatMessage }) {
           isUser
             ? "rounded-br-md bg-accent text-background"
             : "rounded-bl-md bg-[#243040] text-foreground"
-        } ${message.pending ? "opacity-85" : ""}`}
+        } ${dim ? "opacity-55" : ""}`}
       >
         <p className="mb-1 font-mono text-[10px] uppercase tracking-wide opacity-70">
           {isUser ? "Bạn" : "WALL-E"}
@@ -135,11 +170,37 @@ function ChatBubble({ message }: { message: ChatMessage }) {
   );
 }
 
+function turnLabel(phase: string): string {
+  switch (phase) {
+    case "listening":
+      return "Đang nghe bạn";
+    case "thinking":
+      return "AI đang nghĩ (có thể revise)";
+    case "preparing":
+      return "Đang tạo giọng nói…";
+    case "speaking":
+      return "AI đang nói";
+    case "echo_hold":
+      return "Sắp nghe lại…";
+    default:
+      return phase;
+  }
+}
+
 function StatusRow({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-center justify-between gap-4">
       <span className="text-muted">{label}</span>
       <span>{value}</span>
+    </div>
+  );
+}
+
+function LatencyRow({ label, ms }: { label: string; ms?: number }) {
+  return (
+    <div className="flex items-center justify-between gap-4">
+      <span>{label}</span>
+      <span>{ms != null ? `${Math.round(ms)}ms` : "—"}</span>
     </div>
   );
 }

@@ -23,13 +23,15 @@ type BrowserSpeechRecognitionEvent = {
 type SpeechRecognitionConstructor = new () => BrowserSpeechRecognition;
 
 /**
- * Live mic captions via Web Speech API (temporary until real STT provider).
- * Display-only — PCM still goes to backend through Microphone + Transport.
+ * Web Speech captions. When muted/stopped, no results are emitted
+ * (critical on Mac so TTS from speakers cannot become a user caption).
  */
 export class BrowserCaption {
   private recognition: BrowserSpeechRecognition | null = null;
   private handler: CaptionHandler | null = null;
   private wanted = false;
+  private muted = false;
+  private lang = "vi-VN";
 
   onCaption(handler: CaptionHandler): void {
     this.handler = handler;
@@ -39,7 +41,37 @@ export class BrowserCaption {
     return Boolean(getSpeechRecognitionConstructor());
   }
 
+  get isActive(): boolean {
+    return this.wanted && !this.muted && this.recognition != null;
+  }
+
   start(lang = "vi-VN"): void {
+    this.lang = lang;
+    this.muted = false;
+    this.wanted = true;
+    this.boot(lang);
+  }
+
+  /** Soft mute — keep instance but drop every result (no UI / no transport). */
+  mute(): void {
+    this.muted = true;
+  }
+
+  unmute(): void {
+    this.muted = false;
+  }
+
+  /**
+   * Hard stop: abort recognition and detach handlers so late finals
+   * from speaker audio cannot fire into the UI.
+   */
+  stop(): void {
+    this.wanted = false;
+    this.muted = true;
+    this.teardown();
+  }
+
+  private boot(lang: string): void {
     const Ctor = getSpeechRecognitionConstructor();
     if (!Ctor) {
       throw new Error(
@@ -47,8 +79,9 @@ export class BrowserCaption {
       );
     }
 
-    this.stop();
+    this.teardown();
     this.wanted = true;
+    this.muted = false;
 
     const recognition = new Ctor();
     recognition.lang = lang;
@@ -56,6 +89,8 @@ export class BrowserCaption {
     recognition.interimResults = true;
 
     recognition.onresult = (event) => {
+      if (!this.wanted || this.muted) return;
+
       let interim = "";
       let finalText = "";
 
@@ -76,14 +111,13 @@ export class BrowserCaption {
     };
 
     recognition.onerror = (event) => {
-      // `no-speech` / `aborted` are normal; keep listening if still wanted.
       if (event.error === "not-allowed" || event.error === "service-not-allowed") {
         this.wanted = false;
       }
     };
 
     recognition.onend = () => {
-      if (!this.wanted) return;
+      if (!this.wanted || this.muted) return;
       try {
         recognition.start();
       } catch {
@@ -92,20 +126,25 @@ export class BrowserCaption {
     };
 
     this.recognition = recognition;
-    recognition.start();
+    try {
+      recognition.start();
+    } catch {
+      // already started
+    }
   }
 
-  stop(): void {
-    this.wanted = false;
+  private teardown(): void {
     const recognition = this.recognition;
     this.recognition = null;
     if (!recognition) return;
+    recognition.onresult = null;
+    recognition.onerror = null;
     recognition.onend = null;
     try {
-      recognition.stop();
+      recognition.abort();
     } catch {
       try {
-        recognition.abort();
+        recognition.stop();
       } catch {
         // ignore
       }

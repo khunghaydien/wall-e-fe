@@ -19,10 +19,13 @@ const initialState: RuntimeStateSnapshot = {
   llm: LlmStatus.Idle,
   tts: TtsStatus.Idle,
   speaking: SpeakingStatus.Idle,
+  turnPhase: "listening",
   micLevel: 0,
   partialTranscript: "",
   finalTranscript: "",
-  assistantText: "",
+  thinking: false,
+  thinkingMessage: "",
+  metrics: null,
   messages: [],
   error: null,
 };
@@ -61,24 +64,36 @@ export const runtimeStore = {
     return () => listeners.delete(listener);
   },
 
-  /** Live user caption — only while in an open user turn (not waiting for reply). */
+  /** Interim caption — dim bubble. */
   upsertUserDraft(text: string): void {
     const messages = [...state.messages];
     const last = messages[messages.length - 1];
 
-    // Backend chưa trả lời xong → không mở bubble user mới.
-    if (last?.role === "user" && !last.pending) return;
-    if (last?.role === "assistant" && last.pending) return;
+    // Allow extending the user turn even if a premature assistant draft exists —
+    // revise path aborts that draft separately.
+    if (last?.role === "assistant" && last.pending) {
+      messages.pop();
+    }
 
-    if (last?.role === "user" && last.pending) {
-      messages[messages.length - 1] = { ...last, text };
+    const userLast = messages[messages.length - 1];
+    if (userLast?.role === "user") {
+      messages[messages.length - 1] = {
+        ...userLast,
+        text,
+        pending: true,
+        interim: true,
+      };
     } else {
-      messages.push(createChatMessage("user", text, true));
+      const msg = createChatMessage("user", text, true);
+      msg.interim = true;
+      messages.push(msg);
     }
     state = {
       ...state,
       messages,
       partialTranscript: text,
+      thinking: false,
+      thinkingMessage: "",
     };
     emit();
   },
@@ -91,10 +106,10 @@ export const runtimeStore = {
         ...last,
         text,
         pending: false,
+        interim: false,
       };
     } else if (last?.role === "user" && !last.pending) {
-      // Already committed this turn — just refresh text if needed.
-      messages[messages.length - 1] = { ...last, text };
+      messages[messages.length - 1] = { ...last, text, interim: false };
     } else {
       messages.push(createChatMessage("user", text, false));
     }
@@ -111,7 +126,6 @@ export const runtimeStore = {
     if (!delta) return;
     const messages = [...state.messages];
     const last = messages[messages.length - 1];
-    // Chỉ tạo bubble WALL-E khi backend bắt đầu stream chữ thật.
     if (last?.role === "assistant" && last.pending) {
       messages[messages.length - 1] = {
         ...last,
@@ -123,7 +137,8 @@ export const runtimeStore = {
     state = {
       ...state,
       messages,
-      assistantText: state.assistantText + delta,
+      thinking: false,
+      thinkingMessage: "",
     };
     emit();
   },
@@ -136,6 +151,50 @@ export const runtimeStore = {
       state = { ...state, messages };
       emit();
     }
+  },
+
+  /** Drop mid-reply when user keeps talking (revise). */
+  abortAssistantDraft(): void {
+    const messages = [...state.messages];
+    const last = messages[messages.length - 1];
+    if (last?.role === "assistant" && last.pending) {
+      messages.pop();
+    }
+    state = {
+      ...state,
+      messages,
+      thinking: false,
+      thinkingMessage: "",
+    };
+    emit();
+  },
+
+  /** Re-open / extend the user bubble with the merged continuous utterance. */
+  reviseUserMessage(text: string): void {
+    this.abortAssistantDraft();
+    const messages = [...state.messages];
+    const last = messages[messages.length - 1];
+    if (last?.role === "user") {
+      messages[messages.length - 1] = {
+        ...last,
+        text,
+        pending: true,
+        interim: true,
+      };
+    } else {
+      const msg = createChatMessage("user", text, true);
+      msg.interim = true;
+      messages.push(msg);
+    }
+    state = {
+      ...state,
+      messages,
+      partialTranscript: text,
+      finalTranscript: text,
+      thinking: false,
+      thinkingMessage: "",
+    };
+    emit();
   },
 
   getMessages(): ChatMessage[] {
