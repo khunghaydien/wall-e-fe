@@ -83,6 +83,14 @@ export class TransportClient {
     } satisfies ControlMessage);
   }
 
+  /** First audible sample began — lock revise on the backend. */
+  speakerStarted(): void {
+    this.send({
+      type: "control",
+      action: "speaker_started",
+    } satisfies ControlMessage);
+  }
+
   stop(): void {
     this.send({ type: "control", action: "stop" } satisfies ControlMessage);
   }

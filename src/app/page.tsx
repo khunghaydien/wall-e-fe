@@ -177,7 +177,7 @@ function turnLabel(phase: string): string {
     case "thinking":
       return "AI đang nghĩ (có thể revise)";
     case "preparing":
-      return "Đang tạo giọng nói…";
+      return "Đang tạo giọng nói (có thể revise)";
     case "speaking":
       return "AI đang nói";
     case "echo_hold":

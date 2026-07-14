@@ -26,8 +26,9 @@ import { EventBus } from "./EventBus";
 import type { RuntimeEvents } from "./RuntimeEvents";
 import { RuntimeState } from "./RuntimeState";
 
-/** After local playback is truly idle, short settle before opening caption. */
-const ECHO_AFTER_IDLE_MS = 1_000;
+/** After local playback is idle, adaptive settle before opening caption. */
+const ECHO_SETTLE_MIN_MS = 120;
+const ECHO_SETTLE_MAX_MS = 500;
 /** Text filter window after reopen (tail-of-reply bleed). */
 const ECHO_GUARD_MS = 4_000;
 const SPEAKER_IDLE_TIMEOUT_MS = 30_000;
@@ -48,9 +49,9 @@ export type TurnPhase =
  * Stream + revise turn-taking:
  * - listening: caption on, hear user.
  * - thinking: caption STAYS on — if user keeps talking → revise (abort mid-reply).
- * - preparing: TTS synthesizing / audio in flight — caption off.
- * - speaking: audio is queued/playing — caption off.
- * - echo_hold: caption off until room reverb dies, then listen again.
+ * - preparing: TTS synthesizing / audio buffering — caption STAYS on for revise.
+ * - speaking: speaker_started (first audible PCM) — caption off, revise locked.
+ * - echo_hold: caption off until speaker is stably silent, then listen again.
  * - After true EOS: answer once with the merged utterance.
  *
  * Mic is never played to the speaker (user never hears themselves).
@@ -254,13 +255,20 @@ export class VoiceRuntime {
     this.setGate("echo_hold");
     this.stopCaption();
 
-    // Gate on real playback end (not a fixed "wait N seconds while speaking").
+    // Wait until the speaker is truly idle, then for stable silence.
     await Promise.race([
-      this.speaker.whenIdle(),
+      this.speaker.whenSilent({
+        minQuietMs: 80,
+        maxWaitMs: 600,
+        threshold: 0.025,
+      }),
       sleep(SPEAKER_IDLE_TIMEOUT_MS),
     ]);
-    // Brief settle after the speaker actually stopped.
-    await sleep(ECHO_AFTER_IDLE_MS);
+
+    // Adaptive settle: shorter replies reopen mic sooner; long replies
+    // get a bit more room-reverb margin (no fixed 1s hold).
+    const settleMs = adaptiveEchoSettleMs(this.speaker.lastSpeakDurationMs);
+    await sleep(settleMs);
 
     if (!this.started || epoch !== this.listenEpoch) return;
 
@@ -289,12 +297,9 @@ export class VoiceRuntime {
   }
 
   private acceptCaption(raw: string): string | null {
-    // Caption is stopped while preparing/speaking / echo_hold; still hard-gate.
-    if (
-      this.gate === "echo_hold" ||
-      this.gate === "speaking" ||
-      this.gate === "preparing"
-    ) {
+    // Caption stays on through preparing (revise). Hard-gate only once
+    // speaker is audible or during echo settle.
+    if (this.gate === "echo_hold" || this.gate === "speaking") {
       return null;
     }
 
@@ -329,21 +334,45 @@ export class VoiceRuntime {
     if (this.bound) return;
     this.bound = true;
 
+    this.speaker.on("speaker_started", () => {
+      // UI + gate must track real audio out — not TTS enqueue / decode.
+      // From this point revise is locked (notify BE).
+      this.lastAudioAt = performance.now();
+      if (this.gate !== "speaking") {
+        this.setGate("speaking");
+        this.state.setThinking(false);
+        this.events.emit("runtime:thinking", {
+          thinking: false,
+          message: "",
+        });
+      } else {
+        this.armStuckWatchdog("speaking");
+      }
+      this.silenceCaptionForTts();
+      this.transport.speakerStarted();
+      this.setSpeaking(SpeakingStatus.Playing);
+      this.setTts(TtsStatus.Streaming);
+    });
+
+    this.speaker.on("speaker_finished", () => {
+      // Playback drained for this turn. Echo reopen still follows tts_finished
+      // via resumeListeningAfterEcho so mid-stream phrases stay gated.
+      if (this.gate === "speaking" && !this.speaker.isPlaying) {
+        this.setSpeaking(SpeakingStatus.Idle);
+      }
+    });
+
     this.caption.onCaption((raw, isFinal) => {
-      if (
-        this.gate === "echo_hold" ||
-        this.gate === "speaking" ||
-        this.gate === "preparing"
-      ) {
+      if (this.gate === "echo_hold" || this.gate === "speaking") {
         return;
       }
 
       const text = this.acceptCaption(raw);
       if (!text) return;
 
-      // Thinking (pre-TTS): only forward if user ADDED words (revise path).
-      // Speaking keeps caption off — Mac speaker bleed would look like revise.
-      if (this.gate === "thinking") {
+      // Thinking + preparing: revise if user ADDED words. Locked after
+      // speaker_started (speaking) to avoid Mac speaker bleed as revise.
+      if (this.gate === "thinking" || this.gate === "preparing") {
         const seed =
           this.dispatchedSeed ||
           this.state.get().finalTranscript ||
@@ -432,10 +461,11 @@ export class VoiceRuntime {
         if (message.phase === "done") {
           this.events.emit("llm:token", { text: "", done: true });
           this.setLlm(LlmStatus.Idle);
-          // Text is complete — Edge TTS may still be synthesizing the first phrase.
+          // Text is complete — TTS may still be synthesizing. Keep caption on
+          // for revise until speaker_started.
           if (this.gate === "thinking") {
             this.setGate("preparing");
-            this.silenceCaptionForTts();
+            if (!this.caption.isActive) this.startCaption();
             this.setSpeaking(SpeakingStatus.Buffering);
             this.setTts(TtsStatus.Streaming);
           }
@@ -459,11 +489,12 @@ export class VoiceRuntime {
             });
             break;
           case "tts_started":
-            // Audio may already have arrived (sent first). Don't downgrade.
+            // Synth began — prepare UI. Keep caption on for revise until
+            // speaker_started locks the turn.
             if (this.gate !== "speaking") {
               this.setGate("preparing");
+              if (!this.caption.isActive) this.startCaption();
             }
-            this.silenceCaptionForTts();
             this.setTts(TtsStatus.Streaming);
             if (this.gate !== "speaking") {
               this.setSpeaking(SpeakingStatus.Buffering);
@@ -497,9 +528,10 @@ export class VoiceRuntime {
               const merged =
                 this.state.get().finalTranscript ||
                 this.state.get().partialTranscript;
-              const clean = this.lastAssistantText
-                ? stripAssistantEcho(merged, this.lastAssistantText)
-                : merged;
+              // During preparing revise, lastAssistantText is the aborted draft —
+              // only strip if it looks like echo bleed, not user additions.
+              const clean = merged.trim();
+              this.lastAssistantText = "";
               this.resumeListeningForRevise(clean);
             } else {
               void this.resumeListeningAfterEcho();
@@ -524,21 +556,25 @@ export class VoiceRuntime {
         }
       },
       audio: async (message) => {
-        // First audible frame — this is when "AI đang nói" should appear.
+        // Accept audio only while this AI turn is live.
+        // After revise → listening: drop stale frames so aborted TTS never plays.
+        if (this.gate === "thinking") {
+          this.setGate("preparing");
+          if (!this.caption.isActive) this.startCaption();
+        } else if (this.gate !== "preparing" && this.gate !== "speaking") {
+          return;
+        }
+
+        // Buffer / decode only — UI "speaking" is driven by speaker_started.
         this.lastAudioAt = performance.now();
-        if (this.gate !== "speaking") {
-          this.setGate("speaking");
-          this.state.setThinking(false);
-          this.events.emit("runtime:thinking", {
-            thinking: false,
-            message: "",
-          });
-        } else {
-          // Refresh watchdog while audio keeps arriving.
+        if (this.gate === "preparing") {
+          this.armStuckWatchdog("preparing");
+        } else if (this.gate === "speaking") {
           this.armStuckWatchdog("speaking");
         }
-        this.silenceCaptionForTts();
-        this.setSpeaking(SpeakingStatus.Playing);
+        if (this.gate !== "speaking") {
+          this.setSpeaking(SpeakingStatus.Buffering);
+        }
         this.setTts(TtsStatus.Streaming);
         try {
           await this.speaker.enqueueEncoded({
@@ -603,6 +639,13 @@ export class VoiceRuntime {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Scale reopen delay with how long the speaker was active. */
+function adaptiveEchoSettleMs(speakDurationMs: number): number {
+  if (speakDurationMs <= 0) return ECHO_SETTLE_MIN_MS;
+  const scaled = Math.round(speakDurationMs * 0.05);
+  return Math.min(ECHO_SETTLE_MAX_MS, Math.max(ECHO_SETTLE_MIN_MS, scaled));
 }
 
 function mergeLocal(prev: string, next: string): string {

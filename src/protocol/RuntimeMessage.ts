@@ -19,6 +19,8 @@ export type ControlAction =
   | "audio_received"
   | "tts_started"
   | "tts_finished"
+  /** FE → BE: first audible PCM sample started playing; locks revise. */
+  | "speaker_started"
   | "thinking"
   | "metrics"
   | "error";
