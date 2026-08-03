@@ -9,17 +9,28 @@ export type EncodedAudioChunk = {
   timestamp: number;
 };
 
+/** One PCM frame from the WS audio stream. */
+export type StreamPcmFrame = {
+  pcm: Int16Array;
+  sampleRate: number;
+  phraseId: number;
+  frameIndex: number;
+  isLast: boolean;
+  turnId?: string;
+};
+
 export type SpeakerEvent = "speaker_started" | "speaker_finished";
 
 type SpeakerListener = () => void;
 
+/** Minimum buffered audio before starting playback (~120ms). */
+const MIN_STREAM_MS = 120;
+
 /**
- * Reliable speaker queue for PCM / MP3.
- * Serializes enqueues so decode races cannot reorder phrases.
+ * Streaming PCM speaker + legacy encoded blob fallback.
  *
- * Emits:
- * - speaker_started — first audible sample actually begins playing
- * - speaker_finished — queue drained and output is idle/silent
+ * PCM frames are scheduled as soon as ~MIN_STREAM_MS buffer is available.
+ * MP3 blobs still use one-shot decode (legacy provider fallback).
  */
 export class SpeakerPlayer {
   private context: AudioContext | null = null;
@@ -38,11 +49,17 @@ export class SpeakerPlayer {
   private epoch = 0;
   private readonly listeners = new Map<SpeakerEvent, Set<SpeakerListener>>();
 
-  /** Duration of the last completed speak turn (ms). */
+  /** PCM waiting to be scheduled (streaming path). */
+  private streamQueues: Int16Array[] = [];
+  private streamPendingSamples = 0;
+  private streamPhraseId: number | null = null;
+  private streamSampleRate = 24_000;
+
   lastSpeakDurationMs = 0;
 
   get isPlaying(): boolean {
     if (this.pending > 0 || this.sources.size > 0) return true;
+    if (this.streamPendingSamples > 0) return true;
     if (
       this.context &&
       this.nextStartTime > this.context.currentTime + 0.02
@@ -70,6 +87,15 @@ export class SpeakerPlayer {
     return this.enqueueSerial(() => this.enqueueEncodedInner(chunk));
   }
 
+  /**
+   * Push one PCM stream frame — schedules playback without waiting for the
+   * full phrase. Non-blocking (returns before audio is scheduled).
+   */
+  pushStreamFrame(frame: StreamPcmFrame): void {
+    const myEpoch = this.epoch;
+    void this.pushStreamFrameInner(frame, myEpoch);
+  }
+
   whenIdle(): Promise<void> {
     if (!this.isPlaying) return Promise.resolve();
     return new Promise((resolve) => {
@@ -78,11 +104,6 @@ export class SpeakerPlayer {
     });
   }
 
-  /**
-   * Wait until playback is idle and output energy stays quiet.
-   * Used for adaptive echo hold — open mic as soon as the speaker is
-   * stably silent instead of always waiting a fixed second.
-   */
   async whenSilent(options?: {
     minQuietMs?: number;
     maxWaitMs?: number;
@@ -114,7 +135,6 @@ export class SpeakerPlayer {
     }
   }
 
-  /** Instantaneous output RMS in ~0..1 (0 if analyser unavailable). */
   getOutputRms(): number {
     if (!this.analyser) return 0;
     const data = new Uint8Array(this.analyser.fftSize);
@@ -130,6 +150,7 @@ export class SpeakerPlayer {
   flush(): void {
     this.epoch += 1;
     this.chain = Promise.resolve();
+    this.clearStreamPending();
     for (const timer of this.startTimers) clearTimeout(timer);
     this.startTimers.clear();
     if (this.finishedTimer) {
@@ -198,6 +219,106 @@ export class SpeakerPlayer {
     return run;
   }
 
+  private clearStreamPending(): void {
+    this.streamQueues = [];
+    this.streamPendingSamples = 0;
+    this.streamPhraseId = null;
+  }
+
+  private async pushStreamFrameInner(
+    frame: StreamPcmFrame,
+    myEpoch: number,
+  ): Promise<void> {
+    this.pending += 1;
+    try {
+      await this.ensureContext();
+      if (!this.context || myEpoch !== this.epoch) return;
+
+      this.beginTurnIfNeeded();
+
+      if (
+        this.streamPhraseId !== null &&
+        frame.phraseId !== this.streamPhraseId
+      ) {
+        this.flushStreamBuffer(myEpoch, true);
+      }
+
+      this.streamPhraseId = frame.phraseId;
+      this.streamSampleRate = frame.sampleRate;
+      this.streamQueues.push(frame.pcm);
+      this.streamPendingSamples += frame.pcm.length;
+
+      const minSamples = Math.max(
+        1,
+        Math.floor((this.streamSampleRate * MIN_STREAM_MS) / 1000),
+      );
+
+      while (
+        myEpoch === this.epoch &&
+        this.streamPendingSamples >= minSamples
+      ) {
+        this.drainStreamBuffer(minSamples, myEpoch);
+      }
+
+      if (frame.isLast && myEpoch === this.epoch) {
+        this.flushStreamBuffer(myEpoch, true);
+      }
+    } finally {
+      this.pending -= 1;
+      this.notifyIdleIfNeeded();
+    }
+  }
+
+  private drainStreamBuffer(minSamples: number, myEpoch: number): void {
+    if (!this.context || myEpoch !== this.epoch) return;
+
+    let needed = minSamples;
+    const parts: Int16Array[] = [];
+
+    while (needed > 0 && this.streamQueues.length > 0) {
+      const head = this.streamQueues[0]!;
+      if (head.length <= needed) {
+        parts.push(head);
+        needed -= head.length;
+        this.streamPendingSamples -= head.length;
+        this.streamQueues.shift();
+      } else {
+        parts.push(head.subarray(0, needed));
+        this.streamQueues[0] = head.subarray(needed);
+        this.streamPendingSamples -= needed;
+        needed = 0;
+      }
+    }
+
+    if (parts.length === 0) return;
+
+    const total = parts.reduce((n, p) => n + p.length, 0);
+    const merged = new Int16Array(total);
+    let offset = 0;
+    for (const part of parts) {
+      merged.set(part, offset);
+      offset += part.length;
+    }
+
+    const samples = int16ToFloat32(merged);
+    const buffer = this.context.createBuffer(
+      1,
+      samples.length,
+      this.streamSampleRate,
+    );
+    buffer.copyToChannel(Float32Array.from(samples), 0);
+    this.schedule(buffer);
+  }
+
+  private flushStreamBuffer(myEpoch: number, scheduleAll: boolean): void {
+    if (!this.context || myEpoch !== this.epoch) return;
+    if (this.streamPendingSamples <= 0) return;
+
+    if (scheduleAll) {
+      this.drainStreamBuffer(this.streamPendingSamples, myEpoch);
+    }
+  }
+
   private async enqueuePcm(chunk: AudioChunk): Promise<void> {
     const myEpoch = this.epoch;
     this.beginTurnIfNeeded();
@@ -238,7 +359,6 @@ export class SpeakerPlayer {
         const buffer = this.context.createBuffer(
           1,
           samples.length,
-          // Prefer declared rate for streaming PCM providers.
           chunk.sampleRate || this.context.sampleRate,
         );
         buffer.copyToChannel(Float32Array.from(samples), 0);
@@ -292,7 +412,6 @@ export class SpeakerPlayer {
     const timer = setTimeout(() => {
       this.startTimers.delete(timer);
       if (!this.sources.has(source)) return;
-      // Ignore sub-frame priming blips (AudioContext warm-up).
       if (buffer.duration < 0.04) return;
       if (!this.startedEmitted) {
         this.startedEmitted = true;
@@ -324,13 +443,11 @@ export class SpeakerPlayer {
       return;
     }
 
-    // Snapshot duration before waiters wake (echo settle needs it now).
     if (this.speakStartedAt > 0) {
       this.lastSpeakDurationMs = performance.now() - this.speakStartedAt;
     }
     this.flushIdleWaiters();
 
-    // Debounce finished so a decode gap between phrases doesn't end the turn.
     if (
       this.turnActive &&
       this.speakStartedAt > 0 &&

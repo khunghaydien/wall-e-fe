@@ -1,2 +1,6 @@
 export { SpeakerPlayer } from "./player";
-export type { EncodedAudioChunk, SpeakerEvent } from "./player/SpeakerPlayer";
+export type {
+  EncodedAudioChunk,
+  SpeakerEvent,
+  StreamPcmFrame,
+} from "./player/SpeakerPlayer";

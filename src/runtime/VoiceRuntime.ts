@@ -10,7 +10,7 @@ import {
   rootMeanSquare,
   stripAssistantEcho,
 } from "@/hearing";
-import { base64ToBytes } from "@/protocol";
+import { base64ToBytes, base64ToInt16 } from "@/protocol";
 import { SpeakerPlayer } from "@/speaking";
 import { TransportClient } from "@/transport";
 import {
@@ -556,8 +556,6 @@ export class VoiceRuntime {
         }
       },
       audio: async (message) => {
-        // Accept audio only while this AI turn is live.
-        // After revise → listening: drop stale frames so aborted TTS never plays.
         if (this.gate === "thinking") {
           this.setGate("preparing");
           if (!this.caption.isActive) this.startCaption();
@@ -565,7 +563,6 @@ export class VoiceRuntime {
           return;
         }
 
-        // Buffer / decode only — UI "speaking" is driven by speaker_started.
         this.lastAudioAt = performance.now();
         if (this.gate === "preparing") {
           this.armStuckWatchdog("preparing");
@@ -576,7 +573,25 @@ export class VoiceRuntime {
           this.setSpeaking(SpeakingStatus.Buffering);
         }
         this.setTts(TtsStatus.Streaming);
+
         try {
+          const isStreamPcm =
+            message.codec === "pcm_s16le" &&
+            message.frameIndex !== undefined &&
+            message.phraseId !== undefined;
+
+          if (isStreamPcm) {
+            this.speaker.pushStreamFrame({
+              pcm: base64ToInt16(message.data),
+              sampleRate: message.sampleRate,
+              phraseId: message.phraseId!,
+              frameIndex: message.frameIndex!,
+              isLast: message.isLast ?? false,
+              turnId: message.turnId,
+            });
+            return;
+          }
+
           await this.speaker.enqueueEncoded({
             codec: message.codec,
             data: base64ToBytes(message.data),

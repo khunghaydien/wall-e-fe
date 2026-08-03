@@ -1,5 +1,6 @@
 export type AudioCodec = "pcm_s16le" | "opus" | "aac" | "mp3";
 
+/** Audio frame — supports streaming PCM with phrase / turn metadata. */
 export type AudioMessage = {
   type: "audio";
   codec: AudioCodec;
@@ -8,6 +9,11 @@ export type AudioMessage = {
   sequence: number;
   timestamp: number;
   data: string;
+  turnId?: string;
+  phraseId?: number;
+  frameIndex?: number;
+  isLast?: boolean;
+  isTurnLast?: boolean;
 };
 
 export type ControlAction =
@@ -19,6 +25,8 @@ export type ControlAction =
   | "audio_received"
   | "tts_started"
   | "tts_finished"
+  | "audio_start"
+  | "audio_end"
   /** FE → BE: first audible PCM sample started playing; locks revise. */
   | "speaker_started"
   | "thinking"
@@ -31,6 +39,11 @@ export type ControlMessage = {
   message?: string;
   text?: string;
   metrics?: Record<string, number | undefined>;
+  turnId?: string;
+  phraseId?: number;
+  sampleRate?: number;
+  channel?: number;
+  codec?: AudioCodec;
 };
 
 export type TranscriptMessage = {
