@@ -1,1 +1,0 @@
-export { BrowserCaption } from "./BrowserCaption";

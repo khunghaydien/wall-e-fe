@@ -6,34 +6,30 @@ import {
   MicStatus,
   RuntimeStatus,
   SpeakingStatus,
-  SttStatus,
   TtsStatus,
 } from "@/enums";
 
+export type VoiceUiState = RuntimeStateSnapshot & {
+  messages: ChatMessage[];
+};
+
 type Listener = () => void;
 
-const initialState: RuntimeStateSnapshot = {
+const initialState: VoiceUiState = {
   runtime: RuntimeStatus.Idle,
   mic: MicStatus.Idle,
-  stt: SttStatus.Idle,
   llm: LlmStatus.Idle,
   tts: TtsStatus.Idle,
   speaking: SpeakingStatus.Idle,
   turnPhase: "listening",
   micLevel: 0,
-  partialTranscript: "",
-  finalTranscript: "",
   thinking: false,
   thinkingMessage: "",
-  metrics: null,
   messages: [],
   error: null,
 };
 
-let state: RuntimeStateSnapshot = {
-  ...initialState,
-  messages: [],
-};
+let state: VoiceUiState = { ...initialState, messages: [] };
 const listeners = new Set<Listener>();
 
 function emit(): void {
@@ -41,11 +37,11 @@ function emit(): void {
 }
 
 export const runtimeStore = {
-  getState(): RuntimeStateSnapshot {
+  getState(): VoiceUiState {
     return state;
   },
 
-  setState(next: Partial<RuntimeStateSnapshot>): void {
+  setState(next: Partial<VoiceUiState>): void {
     state = {
       ...state,
       ...next,
@@ -64,61 +60,43 @@ export const runtimeStore = {
     return () => listeners.delete(listener);
   },
 
-  /** Interim caption — dim bubble. */
-  upsertUserDraft(text: string): void {
+  upsertUserTranscript(
+    sourceId: string,
+    text: string,
+    isFinal: boolean,
+  ): void {
+    const clean = text.trim();
+    if (!sourceId || !clean) return;
+
     const messages = [...state.messages];
-    const last = messages[messages.length - 1];
+    const existingIndex = messages.findIndex(
+      (message) => message.role === "user" && message.sourceId === sourceId,
+    );
 
-    // Allow extending the user turn even if a premature assistant draft exists —
-    // revise path aborts that draft separately.
-    if (last?.role === "assistant" && last.pending) {
-      messages.pop();
-    }
-
-    const userLast = messages[messages.length - 1];
-    if (userLast?.role === "user") {
-      messages[messages.length - 1] = {
-        ...userLast,
-        text,
-        pending: true,
-        interim: true,
+    if (existingIndex >= 0) {
+      const existing = messages[existingIndex]!;
+      messages[existingIndex] = {
+        ...existing,
+        text: isFinal ? clean : existing.text + clean,
+        pending: !isFinal,
       };
     } else {
-      const msg = createChatMessage("user", text, true);
-      msg.interim = true;
-      messages.push(msg);
-    }
-    state = {
-      ...state,
-      messages,
-      partialTranscript: text,
-      thinking: false,
-      thinkingMessage: "",
-    };
-    emit();
-  },
+      const message = createChatMessage("user", clean, !isFinal);
+      message.sourceId = sourceId;
 
-  commitUserMessage(text: string): void {
-    const messages = [...state.messages];
-    const last = messages[messages.length - 1];
-    if (last?.role === "user" && last.pending) {
-      messages[messages.length - 1] = {
-        ...last,
-        text,
-        pending: false,
-        interim: false,
-      };
-    } else if (last?.role === "user" && !last.pending) {
-      messages[messages.length - 1] = { ...last, text, interim: false };
-    } else {
-      messages.push(createChatMessage("user", text, false));
+      // Input transcription can complete after response generation begins.
+      // Keep the user caption before the trailing assistant draft.
+      const trailingAssistantIndex = messages.findIndex(
+        (item) => item.role === "assistant" && item.pending,
+      );
+      if (trailingAssistantIndex >= 0) {
+        messages.splice(trailingAssistantIndex, 0, message);
+      } else {
+        messages.push(message);
+      }
     }
-    state = {
-      ...state,
-      messages,
-      partialTranscript: "",
-      finalTranscript: text,
-    };
+
+    state = { ...state, messages };
     emit();
   },
 
@@ -153,7 +131,6 @@ export const runtimeStore = {
     }
   },
 
-  /** Drop mid-reply when user keeps talking (revise). */
   abortAssistantDraft(): void {
     const messages = [...state.messages];
     const last = messages[messages.length - 1];
@@ -167,37 +144,5 @@ export const runtimeStore = {
       thinkingMessage: "",
     };
     emit();
-  },
-
-  /** Re-open / extend the user bubble with the merged continuous utterance. */
-  reviseUserMessage(text: string): void {
-    this.abortAssistantDraft();
-    const messages = [...state.messages];
-    const last = messages[messages.length - 1];
-    if (last?.role === "user") {
-      messages[messages.length - 1] = {
-        ...last,
-        text,
-        pending: true,
-        interim: true,
-      };
-    } else {
-      const msg = createChatMessage("user", text, true);
-      msg.interim = true;
-      messages.push(msg);
-    }
-    state = {
-      ...state,
-      messages,
-      partialTranscript: text,
-      finalTranscript: text,
-      thinking: false,
-      thinkingMessage: "",
-    };
-    emit();
-  },
-
-  getMessages(): ChatMessage[] {
-    return state.messages;
   },
 };

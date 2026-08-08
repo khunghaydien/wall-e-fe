@@ -28,9 +28,8 @@ export default function Home() {
             Voice Runtime
           </h1>
           <p className="text-muted text-sm leading-relaxed">
-            Nói liên tục — nếu AI chen sớm (trước khi nói) sẽ abort, gộp câu bạn,
-            rồi trả lời một lần. Lúc AI đang phát loa thì tắt caption để tránh
-            nghe tiếng loa.
+            Cuộc gọi speech-to-speech — lúc AI đang nói thì không nghe mic,
+            không chen lời. Xong lượt mới nghe lại.
           </p>
         </header>
 
@@ -63,21 +62,6 @@ export default function Home() {
                 </div>
               </div>
               <StatusRow label="Speaker" value={state.speaking} />
-              {state.metrics ? (
-                <div className="space-y-1 border-t border-border pt-3 text-xs text-muted">
-                  <p className="uppercase tracking-wide">Latency</p>
-                  <LatencyRow
-                    label="GPT first"
-                    ms={state.metrics.gptFirstTokenMs}
-                  />
-                  <LatencyRow label="GPT done" ms={state.metrics.gptDoneMs} />
-                  <LatencyRow
-                    label="TTS first"
-                    ms={state.metrics.ttsFirstAudioMs}
-                  />
-                  <LatencyRow label="TTS done" ms={state.metrics.ttsDoneMs} />
-                </div>
-              ) : null}
             </div>
           </section>
 
@@ -93,7 +77,7 @@ export default function Home() {
             >
               {state.messages.length === 0 && !state.thinking ? (
                 <p className="px-2 text-sm text-muted">
-                  Start rồi nói — tin nhắn sẽ hiện ở đây.
+                  Start rồi nói — không cần caption trên trình duyệt.
                 </p>
               ) : (
                 <>
@@ -143,7 +127,6 @@ export default function Home() {
 
 function ChatBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user";
-  const dim = Boolean(message.interim || (message.pending && isUser));
 
   return (
     <div
@@ -154,7 +137,7 @@ function ChatBubble({ message }: { message: ChatMessage }) {
           isUser
             ? "rounded-br-md bg-accent text-background"
             : "rounded-bl-md bg-[#243040] text-foreground"
-        } ${dim ? "opacity-55" : ""}`}
+        }`}
       >
         <p className="mb-1 font-mono text-[10px] uppercase tracking-wide opacity-70">
           {isUser ? "Bạn" : "WALL-E"}
@@ -175,9 +158,9 @@ function turnLabel(phase: string): string {
     case "listening":
       return "Đang nghe bạn";
     case "thinking":
-      return "AI đang nghĩ (có thể revise)";
+      return "AI đang nghe và suy nghĩ";
     case "preparing":
-      return "Đang tạo giọng nói (có thể revise)";
+      return "AI đang chuẩn bị trả lời";
     case "speaking":
       return "AI đang nói";
     case "echo_hold":
@@ -192,15 +175,6 @@ function StatusRow({ label, value }: { label: string; value: string }) {
     <div className="flex items-center justify-between gap-4">
       <span className="text-muted">{label}</span>
       <span>{value}</span>
-    </div>
-  );
-}
-
-function LatencyRow({ label, ms }: { label: string; ms?: number }) {
-  return (
-    <div className="flex items-center justify-between gap-4">
-      <span>{label}</span>
-      <span>{ms != null ? `${Math.round(ms)}ms` : "—"}</span>
     </div>
   );
 }

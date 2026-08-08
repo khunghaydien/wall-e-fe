@@ -36,10 +36,6 @@ export class StreamSocket {
     this.ensureOpen().send(JSON.stringify(payload));
   }
 
-  sendBinary(data: ArrayBufferLike): void {
-    this.ensureOpen().send(data);
-  }
-
   close(): void {
     this.socket?.close();
     this.socket = null;

@@ -1,9 +1,6 @@
-export type AudioCodec = "pcm_s16le" | "opus" | "aac" | "mp3";
-
-/** Audio frame — supports streaming PCM with phrase / turn metadata. */
 export type AudioMessage = {
   type: "audio";
-  codec: AudioCodec;
+  codec: "pcm_s16le";
   sampleRate: number;
   channel: number;
   sequence: number;
@@ -13,50 +10,43 @@ export type AudioMessage = {
   phraseId?: number;
   frameIndex?: number;
   isLast?: boolean;
-  isTurnLast?: boolean;
+  itemId?: string;
 };
 
 export type ControlAction =
   | "session_started"
   | "session_stopped"
-  | "call"
   | "stop"
-  | "interrupt"
-  | "audio_received"
-  | "tts_started"
+  | "speech_started"
+  | "speech_stopped"
+  | "response_started"
+  | "playback_interrupted"
+  | "listen_resume"
   | "tts_finished"
-  | "audio_start"
   | "audio_end"
-  /** FE → BE: first audible PCM sample started playing; locks revise. */
-  | "speaker_started"
-  | "thinking"
-  | "metrics"
   | "error";
 
 export type ControlMessage = {
   type: "control";
   action: ControlAction;
   message?: string;
-  text?: string;
-  metrics?: Record<string, number | undefined>;
   turnId?: string;
   phraseId?: number;
-  sampleRate?: number;
-  channel?: number;
-  codec?: AudioCodec;
+  itemId?: string;
+  audioEndMs?: number;
+};
+
+export type AiMessage = {
+  type: "ai";
+  phase: "delta" | "done";
+  delta?: string;
 };
 
 export type TranscriptMessage = {
   type: "transcript";
   text: string;
   isFinal: boolean;
-};
-
-export type AiMessage = {
-  type: "ai";
-  phase: "started" | "delta" | "done";
-  text?: string;
-  delta?: string;
+  itemId?: string;
 };
 
 export type RuntimeMessage =
@@ -110,19 +100,14 @@ export function int16ToBase64(pcm: Int16Array): string {
 }
 
 export function base64ToInt16(data: string): Int16Array {
-  const bytes = base64ToBytes(data);
-  return new Int16Array(
-    bytes.buffer,
-    bytes.byteOffset,
-    Math.floor(bytes.byteLength / 2),
-  );
-}
-
-export function base64ToBytes(data: string): Uint8Array {
   const binary = atob(data);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i += 1) {
     bytes[i] = binary.charCodeAt(i);
   }
-  return bytes;
+  return new Int16Array(
+    bytes.buffer,
+    bytes.byteOffset,
+    Math.floor(bytes.byteLength / 2),
+  );
 }

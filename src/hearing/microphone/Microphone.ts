@@ -6,9 +6,8 @@ export type MicrophoneOptions = {
 };
 
 /**
- * FE WebRTC Processing stage (first step of the hearing chain):
- * getUserMedia echoCancellation + noiseSuppression + autoGainControl.
- * Server HearingEngine continues: Preprocessor → DeepFilter → Level → VAD → STT.
+ * Captures mono PCM via getUserMedia with browser DSP
+ * (echoCancellation, noiseSuppression, autoGainControl).
  */
 export class Microphone {
   private stream: MediaStream | null = null;

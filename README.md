@@ -1,22 +1,20 @@
 # WALL-E Frontend
 
-Next.js client for real-time voice:
+Next.js client for realtime speech-to-speech:
 
 ```
-Mic → STT Streaming → LLM Streaming → TTS Streaming → Speaker
+Mic PCM 24 kHz → WALL-E WebSocket → OpenAI Realtime → Speaker PCM
 ```
 
-## Backend env
+Half-duplex: mic is muted while the assistant speaks. No barge-in.
 
-Defaults point at local backend. Copy `.env.example` → `.env.local` if needed:
+## Env
 
 ```bash
-NEXT_PUBLIC_BACKEND_URL=http://localhost:8000
 NEXT_PUBLIC_BACKEND_WS_URL=ws://localhost:8000
-# NEXT_PUBLIC_STT_WS_URL=ws://localhost:8000/stt
-# NEXT_PUBLIC_LLM_WS_URL=ws://localhost:8000/llm
-# NEXT_PUBLIC_TTS_WS_URL=ws://localhost:8000/tts
 ```
+
+Production: use `wss://…`.
 
 ## Develop
 

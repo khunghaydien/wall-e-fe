@@ -14,15 +14,11 @@ import {
 } from "@/protocol";
 import { StreamSocket } from "@/utils";
 
-/**
- * Transport abstraction — WebSocket today, WebRTC/LiveKit later.
- * Runtime should depend on this, not on a concrete socket type.
- */
+/** Browser ↔ WALL-E voice WebSocket. */
 export class TransportClient {
   private socket: StreamSocket | null = null;
   private handler: RuntimeMessageHandler | null = null;
   private sequence = 0;
-  /** Keep WS handlers ordered so audio is queued before tts_finished/whenIdle. */
   private inbound: Promise<void> = Promise.resolve();
 
   setHandler(handler: RuntimeMessageHandler): void {
@@ -60,34 +56,19 @@ export class TransportClient {
     this.send(message);
   }
 
-  sendTranscript(text: string, isFinal: boolean): void {
-    this.send({
-      type: "transcript",
-      text,
-      isFinal,
-    });
-  }
-
-  call(text?: string): void {
+  playbackInterrupted(itemId: string, audioEndMs: number): void {
     this.send({
       type: "control",
-      action: "call",
-      text,
+      action: "playback_interrupted",
+      itemId,
+      audioEndMs,
     } satisfies ControlMessage);
   }
 
-  interrupt(): void {
+  listenResume(): void {
     this.send({
       type: "control",
-      action: "interrupt",
-    } satisfies ControlMessage);
-  }
-
-  /** First audible sample began — lock revise on the backend. */
-  speakerStarted(): void {
-    this.send({
-      type: "control",
-      action: "speaker_started",
+      action: "listen_resume",
     } satisfies ControlMessage);
   }
 
@@ -100,10 +81,6 @@ export class TransportClient {
     this.socket = null;
     this.sequence = 0;
     this.inbound = Promise.resolve();
-  }
-
-  get isOpen(): boolean {
-    return this.socket?.isOpen ?? false;
   }
 
   private send(message: RuntimeMessage): void {

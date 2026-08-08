@@ -9,14 +9,6 @@ export enum RuntimeStatus {
 export enum MicStatus {
   Idle = "idle",
   Capturing = "capturing",
-  Muted = "muted",
-}
-
-export enum SttStatus {
-  Idle = "idle",
-  Connecting = "connecting",
-  Streaming = "streaming",
-  Error = "error",
 }
 
 export enum LlmStatus {

@@ -24,8 +24,4 @@ export class EventBus<Events extends Record<string, unknown>> {
       handler(payload);
     }
   }
-
-  clear(): void {
-    this.listeners.clear();
-  }
 }

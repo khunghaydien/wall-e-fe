@@ -4,10 +4,10 @@ export type ChatMessage = {
   id: string;
   role: ChatRole;
   text: string;
-  /** Still streaming / interim caption. */
+  /** Still streaming assistant delta. */
   pending?: boolean;
-  /** Provisional (interim) caption — render lighter than final. */
-  interim?: boolean;
+  /** Realtime input item id for updating user transcript deltas. */
+  sourceId?: string;
 };
 
 let messageSeq = 0;

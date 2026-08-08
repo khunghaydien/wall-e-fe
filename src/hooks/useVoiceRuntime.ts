@@ -1,9 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { LlmStatus } from "@/enums";
-import { VoiceRuntime, type RuntimeStateSnapshot } from "@/runtime";
-import { runtimeStore } from "@/stores";
+import { VoiceRuntime } from "@/runtime";
+import { runtimeStore, type VoiceUiState } from "@/stores";
 
 export function useVoiceRuntime() {
   const runtimeRef = useRef<VoiceRuntime | null>(null);
@@ -29,19 +28,8 @@ export function useVoiceRuntime() {
       runtime.events.on("mic:level", (micLevel) => {
         runtimeStore.setState({ micLevel });
       }),
-      runtime.events.on("stt:status", (stt) => {
-        runtimeStore.setState({ stt });
-      }),
       runtime.events.on("llm:status", (llm) => {
         runtimeStore.setState({ llm });
-        if (llm === LlmStatus.Streaming) {
-          const draft =
-            runtimeStore.getState().partialTranscript ||
-            runtimeStore.getState().finalTranscript;
-          if (draft.trim()) {
-            runtimeStore.commitUserMessage(draft.trim());
-          }
-        }
       }),
       runtime.events.on("tts:status", (tts) => {
         runtimeStore.setState({ tts });
@@ -57,33 +45,12 @@ export function useVoiceRuntime() {
           thinking,
           thinkingMessage: message,
         });
-        if (thinking) {
-          const draft =
-            runtimeStore.getState().partialTranscript ||
-            runtimeStore.getState().finalTranscript;
-          if (draft.trim()) {
-            runtimeStore.commitUserMessage(draft.trim());
-          }
-        }
       }),
-      runtime.events.on("runtime:metrics", (metrics) => {
-        runtimeStore.setState({ metrics });
+      runtime.events.on("runtime:interrupted", () => {
+        runtimeStore.abortAssistantDraft();
       }),
-      runtime.events.on("runtime:revise", ({ text }) => {
-        runtimeStore.reviseUserMessage(text);
-      }),
-      runtime.events.on("stt:transcript", (event) => {
-        if (event.isFinal) {
-          // During revise, keep user bubble open (pending) until true EOS reply.
-          const last = runtimeStore.getState().messages.at(-1);
-          if (last?.role === "user" && last.pending) {
-            runtimeStore.reviseUserMessage(event.text);
-          } else {
-            runtimeStore.commitUserMessage(event.text);
-          }
-        } else {
-          runtimeStore.upsertUserDraft(event.text);
-        }
+      runtime.events.on("user:transcript", ({ itemId, text, isFinal }) => {
+        runtimeStore.upsertUserTranscript(itemId, text, isFinal);
       }),
       runtime.events.on("llm:token", (event) => {
         if (event.done) {
@@ -111,14 +78,11 @@ export function useVoiceRuntime() {
     setIsBusy(true);
     try {
       runtimeStore.setState({
-        partialTranscript: "",
-        finalTranscript: "",
         messages: [],
         micLevel: 0,
         thinking: false,
         thinkingMessage: "",
         turnPhase: "listening",
-        metrics: null,
         error: null,
       });
       await runtimeRef.current.start();
@@ -138,7 +102,7 @@ export function useVoiceRuntime() {
   }
 
   return {
-    state: snapshot as RuntimeStateSnapshot,
+    state: snapshot as VoiceUiState,
     isBusy,
     start,
     stop,

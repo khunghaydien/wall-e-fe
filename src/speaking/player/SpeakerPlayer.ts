@@ -1,13 +1,5 @@
 import { int16ToFloat32 } from "@/utils";
 import type { AudioChunk } from "@/types";
-import type { AudioCodec } from "@/protocol";
-
-export type EncodedAudioChunk = {
-  codec: AudioCodec;
-  data: Uint8Array;
-  sampleRate: number;
-  timestamp: number;
-};
 
 /** One PCM frame from the WS audio stream. */
 export type StreamPcmFrame = {
@@ -27,19 +19,14 @@ type SpeakerListener = () => void;
 const MIN_STREAM_MS = 120;
 
 /**
- * Streaming PCM speaker + legacy encoded blob fallback.
- *
- * PCM frames are scheduled as soon as ~MIN_STREAM_MS buffer is available.
- * MP3 blobs still use one-shot decode (legacy provider fallback).
+ * Streaming PCM speaker for Realtime audio deltas.
  */
 export class SpeakerPlayer {
   private context: AudioContext | null = null;
   private masterGain: GainNode | null = null;
-  private analyser: AnalyserNode | null = null;
   private nextStartTime = 0;
   private sources = new Set<AudioBufferSourceNode>();
   private pending = 0;
-  private idleWaiters: Array<() => void> = [];
   private chain: Promise<void> = Promise.resolve();
   private turnActive = false;
   private startedEmitted = false;
@@ -49,13 +36,10 @@ export class SpeakerPlayer {
   private epoch = 0;
   private readonly listeners = new Map<SpeakerEvent, Set<SpeakerListener>>();
 
-  /** PCM waiting to be scheduled (streaming path). */
   private streamQueues: Int16Array[] = [];
   private streamPendingSamples = 0;
   private streamPhraseId: number | null = null;
   private streamSampleRate = 24_000;
-
-  lastSpeakDurationMs = 0;
 
   get isPlaying(): boolean {
     if (this.pending > 0 || this.sources.size > 0) return true;
@@ -69,6 +53,12 @@ export class SpeakerPlayer {
     return false;
   }
 
+  /** Approximate audio heard by the user in the current response. */
+  get currentPlaybackMs(): number {
+    if (this.speakStartedAt <= 0) return 0;
+    return Math.max(0, performance.now() - this.speakStartedAt);
+  }
+
   on(event: SpeakerEvent, listener: SpeakerListener): () => void {
     let set = this.listeners.get(event);
     if (!set) {
@@ -79,72 +69,19 @@ export class SpeakerPlayer {
     return () => set!.delete(listener);
   }
 
+  /** Unlock AudioContext on a user gesture (silent buffer). */
   async enqueue(chunk: AudioChunk): Promise<void> {
-    return this.enqueueSerial(() => this.enqueuePcm(chunk));
+    const run = this.chain.then(
+      () => this.enqueuePcm(chunk),
+      () => this.enqueuePcm(chunk),
+    );
+    this.chain = run.catch(() => undefined);
+    return run;
   }
 
-  async enqueueEncoded(chunk: EncodedAudioChunk): Promise<void> {
-    return this.enqueueSerial(() => this.enqueueEncodedInner(chunk));
-  }
-
-  /**
-   * Push one PCM stream frame — schedules playback without waiting for the
-   * full phrase. Non-blocking (returns before audio is scheduled).
-   */
   pushStreamFrame(frame: StreamPcmFrame): void {
     const myEpoch = this.epoch;
     void this.pushStreamFrameInner(frame, myEpoch);
-  }
-
-  whenIdle(): Promise<void> {
-    if (!this.isPlaying) return Promise.resolve();
-    return new Promise((resolve) => {
-      this.idleWaiters.push(resolve);
-      this.notifyIdleIfNeeded();
-    });
-  }
-
-  async whenSilent(options?: {
-    minQuietMs?: number;
-    maxWaitMs?: number;
-    threshold?: number;
-  }): Promise<void> {
-    const minQuietMs = options?.minQuietMs ?? 100;
-    const maxWaitMs = options?.maxWaitMs ?? 800;
-    const threshold = options?.threshold ?? 0.02;
-
-    await this.whenIdle();
-
-    const started = performance.now();
-    let quietSince = performance.now();
-
-    while (performance.now() - started < maxWaitMs) {
-      if (this.isPlaying) {
-        await this.whenIdle();
-        quietSince = performance.now();
-        continue;
-      }
-
-      const rms = this.getOutputRms();
-      if (rms < threshold) {
-        if (performance.now() - quietSince >= minQuietMs) return;
-      } else {
-        quietSince = performance.now();
-      }
-      await sleep(40);
-    }
-  }
-
-  getOutputRms(): number {
-    if (!this.analyser) return 0;
-    const data = new Uint8Array(this.analyser.fftSize);
-    this.analyser.getByteTimeDomainData(data);
-    let sum = 0;
-    for (let i = 0; i < data.length; i += 1) {
-      const v = (data[i]! - 128) / 128;
-      sum += v * v;
-    }
-    return Math.sqrt(sum / data.length);
   }
 
   flush(): void {
@@ -168,7 +105,6 @@ export class SpeakerPlayer {
     this.pending = 0;
     this.nextStartTime = this.context?.currentTime ?? 0;
     this.finishTurnIfNeeded(false);
-    this.flushIdleWaiters();
   }
 
   async stop(): Promise<void> {
@@ -176,7 +112,6 @@ export class SpeakerPlayer {
     await this.context?.close();
     this.context = null;
     this.masterGain = null;
-    this.analyser = null;
   }
 
   private emit(event: SpeakerEvent): void {
@@ -196,27 +131,17 @@ export class SpeakerPlayer {
     this.turnActive = true;
     this.startedEmitted = false;
     this.speakStartedAt = 0;
-    this.lastSpeakDurationMs = 0;
   }
 
   private finishTurnIfNeeded(emitFinished: boolean): void {
     if (!this.turnActive) return;
     const didStart = this.speakStartedAt > 0;
-    if (didStart) {
-      this.lastSpeakDurationMs = performance.now() - this.speakStartedAt;
-    }
     this.turnActive = false;
     this.startedEmitted = false;
     this.speakStartedAt = 0;
     if (emitFinished && didStart) {
       this.emit("speaker_finished");
     }
-  }
-
-  private enqueueSerial(task: () => Promise<void>): Promise<void> {
-    const run = this.chain.then(task, task);
-    this.chain = run.catch(() => undefined);
-    return run;
   }
 
   private clearStreamPending(): void {
@@ -240,13 +165,15 @@ export class SpeakerPlayer {
         this.streamPhraseId !== null &&
         frame.phraseId !== this.streamPhraseId
       ) {
-        this.flushStreamBuffer(myEpoch, true);
+        this.flushStreamBuffer(myEpoch);
       }
 
       this.streamPhraseId = frame.phraseId;
       this.streamSampleRate = frame.sampleRate;
-      this.streamQueues.push(frame.pcm);
-      this.streamPendingSamples += frame.pcm.length;
+      if (frame.pcm.length > 0) {
+        this.streamQueues.push(frame.pcm);
+        this.streamPendingSamples += frame.pcm.length;
+      }
 
       const minSamples = Math.max(
         1,
@@ -261,7 +188,7 @@ export class SpeakerPlayer {
       }
 
       if (frame.isLast && myEpoch === this.epoch) {
-        this.flushStreamBuffer(myEpoch, true);
+        this.flushStreamBuffer(myEpoch);
       }
     } finally {
       this.pending -= 1;
@@ -310,13 +237,10 @@ export class SpeakerPlayer {
     this.schedule(buffer);
   }
 
-  private flushStreamBuffer(myEpoch: number, scheduleAll: boolean): void {
+  private flushStreamBuffer(myEpoch: number): void {
     if (!this.context || myEpoch !== this.epoch) return;
     if (this.streamPendingSamples <= 0) return;
-
-    if (scheduleAll) {
-      this.drainStreamBuffer(this.streamPendingSamples, myEpoch);
-    }
+    this.drainStreamBuffer(this.streamPendingSamples, myEpoch);
   }
 
   private async enqueuePcm(chunk: AudioChunk): Promise<void> {
@@ -341,54 +265,12 @@ export class SpeakerPlayer {
     }
   }
 
-  private async enqueueEncodedInner(chunk: EncodedAudioChunk): Promise<void> {
-    const myEpoch = this.epoch;
-    this.beginTurnIfNeeded();
-    this.pending += 1;
-    try {
-      await this.ensureContext();
-      if (!this.context || myEpoch !== this.epoch) return;
-
-      if (chunk.codec === "pcm_s16le") {
-        const pcm = new Int16Array(
-          chunk.data.buffer,
-          chunk.data.byteOffset,
-          Math.floor(chunk.data.byteLength / 2),
-        );
-        const samples = int16ToFloat32(pcm);
-        const buffer = this.context.createBuffer(
-          1,
-          samples.length,
-          chunk.sampleRate || this.context.sampleRate,
-        );
-        buffer.copyToChannel(Float32Array.from(samples), 0);
-        if (myEpoch !== this.epoch) return;
-        this.schedule(buffer);
-        return;
-      }
-
-      const bytes = chunk.data;
-      const ab = new ArrayBuffer(bytes.byteLength);
-      new Uint8Array(ab).set(bytes);
-      const decoded = await this.context.decodeAudioData(ab);
-      if (myEpoch !== this.epoch) return;
-      this.schedule(decoded);
-    } finally {
-      this.pending -= 1;
-      this.notifyIdleIfNeeded();
-    }
-  }
-
   private async ensureContext(): Promise<void> {
     if (typeof window === "undefined") return;
     this.context ??= new AudioContext();
-    if (!this.masterGain || !this.analyser) {
+    if (!this.masterGain) {
       this.masterGain = this.context.createGain();
-      this.analyser = this.context.createAnalyser();
-      this.analyser.fftSize = 256;
-      this.analyser.smoothingTimeConstant = 0.3;
-      this.masterGain.connect(this.analyser);
-      this.analyser.connect(this.context.destination);
+      this.masterGain.connect(this.context.destination);
     }
     if (this.context.state === "suspended") {
       await this.context.resume();
@@ -443,11 +325,6 @@ export class SpeakerPlayer {
       return;
     }
 
-    if (this.speakStartedAt > 0) {
-      this.lastSpeakDurationMs = performance.now() - this.speakStartedAt;
-    }
-    this.flushIdleWaiters();
-
     if (
       this.turnActive &&
       this.speakStartedAt > 0 &&
@@ -461,15 +338,4 @@ export class SpeakerPlayer {
       }, 180);
     }
   }
-
-  private flushIdleWaiters(): void {
-    if (this.idleWaiters.length === 0) return;
-    const waiters = this.idleWaiters;
-    this.idleWaiters = [];
-    waiters.forEach((resolve) => resolve());
-  }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
