@@ -6,7 +6,16 @@ import {
   SpeakingStatus,
   TtsStatus,
 } from "@/enums";
-import { Microphone, rootMeanSquare } from "@/hearing";
+import {
+  findInputById,
+  listAudioDevices,
+  Microphone,
+  pickMatchingOutput,
+  pickPreferredInput,
+  rootMeanSquare,
+  type AudioDeviceInfo,
+  type AudioDeviceLists,
+} from "@/hearing";
 import { base64ToInt16 } from "@/protocol";
 import { SpeakerPlayer } from "@/speaking";
 import { TransportClient } from "@/transport";
@@ -25,11 +34,19 @@ export type TurnPhase =
 /** Wait after speaker stops before opening the mic again. */
 const ECHO_SETTLE_MS = 400;
 
+export type AudioRouteSelection = {
+  inputId?: string;
+  outputId?: string;
+};
+
 /**
  * Half-duplex speech-to-speech runtime.
  *
  * Mic audio is sent only while listening/thinking. While the assistant is
  * preparing or speaking there is no barge-in.
+ *
+ * Bluetooth: capture without forcing sampleRate, resample to 24 kHz uplink,
+ * and route playback to the output that shares groupId with the mic.
  */
 export class RealtimeVoiceRuntime {
   readonly events = new EventBus<RuntimeEvents>();
@@ -51,6 +68,22 @@ export class RealtimeVoiceRuntime {
   private interruptedItemId = "";
   private gate: TurnPhase = "listening";
   private listenEpoch = 0;
+  private preferredInputId: string | undefined;
+  private preferredOutputId: string | undefined;
+  private deviceChangeHandler: (() => void) | null = null;
+  private routing = false;
+
+  getAudioDevices(): Promise<AudioDeviceLists> {
+    return listAudioDevices();
+  }
+
+  /** Remember user picks; applies immediately if the session is already running. */
+  async setAudioDevices(selection: AudioRouteSelection): Promise<void> {
+    this.preferredInputId = selection.inputId;
+    this.preferredOutputId = selection.outputId;
+    if (!this.started) return;
+    await this.applyAudioRouting({ forceInput: true });
+  }
 
   async start(): Promise<void> {
     if (this.started) return;
@@ -69,9 +102,12 @@ export class RealtimeVoiceRuntime {
           sampleRate: AUDIO_SAMPLE_RATE,
           timestamp: performance.now(),
         }),
-        this.mic.start(),
+        this.mic.start(this.preferredInputId),
         this.transport.connect(),
       ]);
+
+      await this.applyAudioRouting({ forceInput: false });
+      this.watchDeviceChanges();
 
       this.setMic(MicStatus.Capturing);
       this.setLlm(LlmStatus.Idle);
@@ -241,6 +277,83 @@ export class RealtimeVoiceRuntime {
     });
   }
 
+  /**
+   * Prefer Bluetooth (or user pick), keep mic + speaker on the same headset
+   * via MediaDeviceInfo.groupId, and setSinkId for playback.
+   */
+  private async applyAudioRouting(opts: {
+    forceInput: boolean;
+  }): Promise<void> {
+    if (this.routing) return;
+    this.routing = true;
+    try {
+      const { inputs, outputs } = await listAudioDevices();
+      const preferredInput = pickPreferredInput(inputs, this.preferredInputId);
+      const activeId = this.mic.activeDeviceId;
+      const shouldSwitchInput =
+        Boolean(preferredInput) &&
+        (opts.forceInput ||
+          (preferredInput &&
+            preferredInput.deviceId !== activeId &&
+            // Auto-switch to BT when OS still held the built-in mic.
+            (Boolean(this.preferredInputId) ||
+              /bluetooth|airpods|buds|headset/i.test(preferredInput.label))));
+
+      if (shouldSwitchInput && preferredInput) {
+        await this.mic.setDevice(preferredInput.deviceId);
+      }
+
+      const inputAfter =
+        findInputById(inputs, this.mic.activeDeviceId) ?? preferredInput;
+      const output = pickMatchingOutput(
+        outputs,
+        inputAfter,
+        this.preferredOutputId,
+      );
+
+      await this.speaker.setOutputDevice(output?.deviceId);
+      this.emitAudioRoute(inputAfter, output);
+    } catch (error) {
+      console.warn("[runtime] audio routing failed", error);
+    } finally {
+      this.routing = false;
+    }
+  }
+
+  private emitAudioRoute(
+    input?: AudioDeviceInfo,
+    output?: AudioDeviceInfo,
+  ): void {
+    this.events.emit("audio:route", {
+      inputId: input?.deviceId,
+      inputLabel: input?.label,
+      outputId: output?.deviceId,
+      outputLabel: output?.label,
+    });
+  }
+
+  private watchDeviceChanges(): void {
+    if (typeof navigator === "undefined" || !navigator.mediaDevices) return;
+    this.unwatchDeviceChanges();
+    this.deviceChangeHandler = () => {
+      if (!this.started) return;
+      void this.applyAudioRouting({ forceInput: false });
+    };
+    navigator.mediaDevices.addEventListener(
+      "devicechange",
+      this.deviceChangeHandler,
+    );
+  }
+
+  private unwatchDeviceChanges(): void {
+    if (!this.deviceChangeHandler || typeof navigator === "undefined") return;
+    navigator.mediaDevices.removeEventListener(
+      "devicechange",
+      this.deviceChangeHandler,
+    );
+    this.deviceChangeHandler = null;
+  }
+
   private isMicOpen(): boolean {
     return this.gate === "listening" || this.gate === "thinking";
   }
@@ -276,6 +389,7 @@ export class RealtimeVoiceRuntime {
   }
 
   private async teardown(): Promise<void> {
+    this.unwatchDeviceChanges();
     this.listenEpoch += 1;
     this.userSpeaking = false;
     this.responseDone = true;

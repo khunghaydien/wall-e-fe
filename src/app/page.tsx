@@ -1,12 +1,25 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 import { RuntimeStatus } from "@/enums";
 import { useVoiceRuntime } from "@/hooks";
 import type { ChatMessage } from "@/types";
 
 export default function Home() {
-  const { state, isBusy, start, stop } = useVoiceRuntime();
+  const {
+    state,
+    isBusy,
+    start,
+    stop,
+    inputs,
+    outputs,
+    selectedInputId,
+    selectedOutputId,
+    route,
+    refreshDevices,
+    selectInput,
+    selectOutput,
+  } = useVoiceRuntime();
   const isRunning = state.runtime === RuntimeStatus.Running;
   const levelPct = Math.round(Math.min(1, state.micLevel) * 100);
   const listRef = useRef<HTMLDivElement>(null);
@@ -32,6 +45,57 @@ export default function Home() {
             không chen lời. Xong lượt mới nghe lại.
           </p>
         </header>
+
+        <section className="rounded-xl border border-border bg-panel p-4 font-mono text-sm">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <p className="text-muted text-xs uppercase tracking-wide">
+              Thiết bị âm thanh
+            </p>
+            <button
+              type="button"
+              onClick={() => void refreshDevices(true)}
+              className="rounded border border-border px-2.5 py-1 text-xs text-muted hover:text-foreground"
+            >
+              Làm mới
+            </button>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label className="flex flex-col gap-1.5">
+              <span className="text-muted text-xs">Micro</span>
+              <DeviceSelect
+                value={selectedInputId}
+                onChange={(value) => void selectInput(value)}
+              >
+                <option value="">Tự chọn (ưu tiên Bluetooth)</option>
+                {inputs.map((device) => (
+                  <option key={device.deviceId} value={device.deviceId}>
+                    {device.label}
+                  </option>
+                ))}
+              </DeviceSelect>
+            </label>
+            <label className="flex flex-col gap-1.5">
+              <span className="text-muted text-xs">Loa / tai nghe</span>
+              <DeviceSelect
+                value={selectedOutputId}
+                onChange={(value) => void selectOutput(value)}
+              >
+                <option value="">Ghép theo micro (cùng Bluetooth)</option>
+                {outputs.map((device) => (
+                  <option key={device.deviceId} value={device.deviceId}>
+                    {device.label}
+                  </option>
+                ))}
+              </DeviceSelect>
+            </label>
+          </div>
+          {(route.inputLabel || route.outputLabel) && (
+            <p className="mt-3 text-xs text-muted">
+              Đang dùng: {route.inputLabel ?? "—"} →{" "}
+              {route.outputLabel ?? "mặc định hệ thống"}
+            </p>
+          )}
+        </section>
 
         <div className="grid h-[min(62vh,520px)] grid-cols-1 gap-4 md:grid-cols-2">
           <section className="flex h-full min-h-0 flex-col rounded-xl border border-border bg-panel p-5 font-mono text-sm">
@@ -175,6 +239,42 @@ function StatusRow({ label, value }: { label: string; value: string }) {
     <div className="flex items-center justify-between gap-4">
       <span className="text-muted">{label}</span>
       <span>{value}</span>
+    </div>
+  );
+}
+
+function DeviceSelect({
+  value,
+  onChange,
+  children,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  children: ReactNode;
+}) {
+  return (
+    <div className="relative">
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full appearance-none rounded-lg border border-border bg-background py-2.5 pl-3 pr-10 text-sm"
+      >
+        {children}
+      </select>
+      <span
+        aria-hidden
+        className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-muted"
+      >
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+          <path
+            d="M2.5 4.5L6 8L9.5 4.5"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      </span>
     </div>
   );
 }

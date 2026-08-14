@@ -31,4 +31,10 @@ export type RuntimeEvents = {
   "llm:token": LlmTokenEvent;
   "tts:status": TtsStatus;
   "speaking:status": SpeakingStatus;
+  "audio:route": {
+    inputId?: string;
+    inputLabel?: string;
+    outputId?: string;
+    outputLabel?: string;
+  };
 };

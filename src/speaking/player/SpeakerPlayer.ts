@@ -20,6 +20,9 @@ const MIN_STREAM_MS = 120;
 
 /**
  * Streaming PCM speaker for Realtime audio deltas.
+ *
+ * Routes to a chosen output via AudioContext.setSinkId when available
+ * (needed for Bluetooth headsets paired with the mic).
  */
 export class SpeakerPlayer {
   private context: AudioContext | null = null;
@@ -34,12 +37,17 @@ export class SpeakerPlayer {
   private startTimers = new Set<ReturnType<typeof setTimeout>>();
   private finishedTimer: ReturnType<typeof setTimeout> | null = null;
   private epoch = 0;
+  private sinkId: string | undefined;
   private readonly listeners = new Map<SpeakerEvent, Set<SpeakerListener>>();
 
   private streamQueues: Int16Array[] = [];
   private streamPendingSamples = 0;
   private streamPhraseId: number | null = null;
   private streamSampleRate = 24_000;
+
+  get outputDeviceId(): string | undefined {
+    return this.sinkId;
+  }
 
   get isPlaying(): boolean {
     if (this.pending > 0 || this.sources.size > 0) return true;
@@ -112,6 +120,13 @@ export class SpeakerPlayer {
     await this.context?.close();
     this.context = null;
     this.masterGain = null;
+  }
+
+  /** Route Web Audio output to a specific device (Bluetooth speaker/headset). */
+  async setOutputDevice(deviceId: string | undefined): Promise<void> {
+    this.sinkId = deviceId;
+    if (!this.context) return;
+    await this.applySinkId(this.context);
   }
 
   private emit(event: SpeakerEvent): void {
@@ -267,13 +282,31 @@ export class SpeakerPlayer {
 
   private async ensureContext(): Promise<void> {
     if (typeof window === "undefined") return;
-    this.context ??= new AudioContext();
+    if (!this.context) {
+      const options: AudioContextOptions & { sinkId?: string } = {};
+      if (this.sinkId) options.sinkId = this.sinkId;
+      this.context = new AudioContext(options);
+      await this.applySinkId(this.context);
+    }
     if (!this.masterGain) {
       this.masterGain = this.context.createGain();
       this.masterGain.connect(this.context.destination);
     }
     if (this.context.state === "suspended") {
       await this.context.resume();
+    }
+  }
+
+  private async applySinkId(context: AudioContext): Promise<void> {
+    if (!this.sinkId) return;
+    const ctx = context as AudioContext & {
+      setSinkId?: (id: string) => Promise<void>;
+    };
+    if (typeof ctx.setSinkId !== "function") return;
+    try {
+      await ctx.setSinkId(this.sinkId);
+    } catch (error) {
+      console.warn("[speaker] setSinkId failed — using system default output", error);
     }
   }
 
