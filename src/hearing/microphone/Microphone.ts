@@ -5,21 +5,28 @@ export type MicrophoneOptions = {
   /** Target rate for frames sent to the transport (e.g. 24 kHz). */
   sampleRate: number;
   channelCount: number;
-  /** Prefer this input when available (Bluetooth headset, etc.). */
+  /** Prefer this input when available (only when user picks it). */
   deviceId?: string;
+};
+
+type AudioContextWithSink = AudioContext & {
+  setSinkId?: (sinkId: string | { type: "none" }) => Promise<void>;
 };
 
 /**
  * Captures mono PCM via getUserMedia with browser DSP.
  *
- * Does not force hardware sampleRate — Bluetooth HFP/SCO often only
- * supports 8–16 kHz. Capture at the device rate, then resample uplink.
+ * Critical for Bluetooth speakers (A2DP): the capture AudioContext must NOT
+ * claim the real hardware output. Connecting ScriptProcessor → destination
+ * steals the OS default sink (often the BT speaker) and renegotiates the
+ * link — YouTube only plays audio, so it never hits this path.
  */
 export class Microphone {
   private stream: MediaStream | null = null;
-  private context: AudioContext | null = null;
+  private context: AudioContextWithSink | null = null;
   private processor: ScriptProcessorNode | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
+  private discard: MediaStreamAudioDestinationNode | null = null;
   private onFrameCallback: ((frame: AudioFrame) => void) | null = null;
   private deviceId: string | undefined;
   private started = false;
@@ -47,7 +54,7 @@ export class Microphone {
     this.started = true;
   }
 
-  /** Hot-swap input (e.g. Bluetooth headset connected while running). */
+  /** Hot-swap input (user pick or safe remount away from BT HFP). */
   async setDevice(deviceId: string | undefined): Promise<void> {
     this.deviceId = deviceId;
     if (!this.started) return;
@@ -66,25 +73,23 @@ export class Microphone {
       this.stream = await this.getStream(deviceId, true);
     } catch (error) {
       if (deviceId) {
-        // Exact device may be gone or reject constraints — fall back to default.
         this.stream = await this.getStream(undefined, false);
       } else {
         throw error;
       }
     }
 
-    // Match the hardware clock; do not force 24 kHz (breaks many BT headsets).
-    this.context = new AudioContext();
+    // Match hardware clock; do not force 24 kHz.
+    this.context = new AudioContext() as AudioContextWithSink;
+    await this.applySilentSink(this.context);
     if (this.context.state === "suspended") {
       await this.context.resume();
     }
 
     this.source = this.context.createMediaStreamSource(this.stream);
+    // Keep the processor graph alive without routing to real speakers/BT.
+    this.discard = this.context.createMediaStreamDestination();
 
-    const silent = this.context.createGain();
-    silent.gain.value = 0;
-
-    // Larger buffer is more tolerant of Bluetooth SCO jitter.
     this.processor = this.context.createScriptProcessor(2048, 1, 1);
     this.processor.onaudioprocess = (event) => {
       const input = event.inputBuffer.getChannelData(0);
@@ -102,8 +107,17 @@ export class Microphone {
     };
 
     this.source.connect(this.processor);
-    this.processor.connect(silent);
-    silent.connect(this.context.destination);
+    this.processor.connect(this.discard);
+  }
+
+  /** Chrome: mute the capture context so it never owns the BT A2DP sink. */
+  private async applySilentSink(context: AudioContextWithSink): Promise<void> {
+    if (typeof context.setSinkId !== "function") return;
+    try {
+      await context.setSinkId({ type: "none" });
+    } catch {
+      // Older browsers — MediaStreamDestination above still avoids speakers.
+    }
   }
 
   private async getStream(
@@ -111,7 +125,6 @@ export class Microphone {
     preferExactDevice: boolean,
   ): Promise<MediaStream> {
     const audio: MediaTrackConstraints = {
-      // Soft constraints — Bluetooth often cannot honor exact sampleRate/channelCount.
       channelCount: { ideal: this.options.channelCount },
       echoCancellation: true,
       noiseSuppression: true,
@@ -135,6 +148,8 @@ export class Microphone {
     this.processor = null;
     this.source?.disconnect();
     this.source = null;
+    this.discard?.disconnect();
+    this.discard = null;
 
     await this.context?.close().catch(() => undefined);
     this.context = null;

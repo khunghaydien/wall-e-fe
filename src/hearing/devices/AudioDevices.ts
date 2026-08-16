@@ -54,7 +54,14 @@ export function isBluetoothLabel(label: string): boolean {
   return BT_HINT.test(label);
 }
 
-export function pickPreferredInput(
+/**
+ * Pick a mic that will not force Bluetooth into HFP/SCO.
+ *
+ * Auto-selecting a BT mic (or the "communications" device) is what kicks
+ * A2DP speakers offline — YouTube never opens a mic, so the speaker stays up.
+ * Only use Bluetooth input when the user explicitly selects it.
+ */
+export function pickSafeInput(
   inputs: AudioDeviceInfo[],
   preferredId?: string,
 ): AudioDeviceInfo | undefined {
@@ -62,17 +69,35 @@ export function pickPreferredInput(
     const exact = inputs.find((d) => d.deviceId === preferredId);
     if (exact) return exact;
   }
-  const bluetooth = inputs.find((d) => isBluetoothLabel(d.label));
-  if (bluetooth) return bluetooth;
+
+  const builtIn = inputs.find(
+    (d) =>
+      d.deviceId !== "default" &&
+      d.deviceId !== "communications" &&
+      !isBluetoothLabel(d.label),
+  );
+  if (builtIn) return builtIn;
+
   return (
-    inputs.find((d) => d.deviceId === "default" || d.deviceId === "communications") ??
+    inputs.find((d) => d.deviceId === "default") ??
+    inputs.find((d) => !isBluetoothLabel(d.label)) ??
     inputs[0]
   );
 }
 
+/** @deprecated Use pickSafeInput — kept for callers that still import the old name. */
+export function pickPreferredInput(
+  inputs: AudioDeviceInfo[],
+  preferredId?: string,
+): AudioDeviceInfo | undefined {
+  return pickSafeInput(inputs, preferredId);
+}
+
 /**
- * Prefer the output that shares groupId with the active mic (same BT headset),
- * then any Bluetooth output, then system default.
+ * Output routing:
+ * - User pick → that device (setSinkId)
+ * - Mic is an explicit BT headset → same groupId speaker
+ * - Otherwise → system default (undefined), same as YouTube / OS BT speaker
  */
 export function pickMatchingOutput(
   outputs: AudioDeviceInfo[],
@@ -83,18 +108,15 @@ export function pickMatchingOutput(
     const exact = outputs.find((d) => d.deviceId === preferredId);
     if (exact) return exact;
   }
-  if (input?.groupId) {
+
+  if (input && isBluetoothLabel(input.label) && input.groupId) {
     const matched = outputs.find(
       (d) => d.groupId === input.groupId && d.deviceId.length > 0,
     );
     if (matched) return matched;
   }
-  const bluetooth = outputs.find((d) => isBluetoothLabel(d.label));
-  if (bluetooth) return bluetooth;
-  return (
-    outputs.find((d) => d.deviceId === "default" || d.deviceId === "communications") ??
-    outputs[0]
-  );
+
+  return undefined;
 }
 
 export function findInputById(

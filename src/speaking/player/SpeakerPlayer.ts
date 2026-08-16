@@ -122,7 +122,7 @@ export class SpeakerPlayer {
     this.masterGain = null;
   }
 
-  /** Route Web Audio output to a specific device (Bluetooth speaker/headset). */
+  /** Route Web Audio output to a specific device, or "" for system default. */
   async setOutputDevice(deviceId: string | undefined): Promise<void> {
     this.sinkId = deviceId;
     if (!this.context) return;
@@ -298,13 +298,13 @@ export class SpeakerPlayer {
   }
 
   private async applySinkId(context: AudioContext): Promise<void> {
-    if (!this.sinkId) return;
     const ctx = context as AudioContext & {
       setSinkId?: (id: string) => Promise<void>;
     };
     if (typeof ctx.setSinkId !== "function") return;
     try {
-      await ctx.setSinkId(this.sinkId);
+      // Empty string = OS default output (YouTube path / BT A2DP).
+      await ctx.setSinkId(this.sinkId ?? "");
     } catch (error) {
       console.warn("[speaker] setSinkId failed — using system default output", error);
     }

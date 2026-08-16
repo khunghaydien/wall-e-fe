@@ -8,10 +8,11 @@ import {
 } from "@/enums";
 import {
   findInputById,
+  isBluetoothLabel,
   listAudioDevices,
   Microphone,
   pickMatchingOutput,
-  pickPreferredInput,
+  pickSafeInput,
   rootMeanSquare,
   type AudioDeviceInfo,
   type AudioDeviceLists,
@@ -45,8 +46,9 @@ export type AudioRouteSelection = {
  * Mic audio is sent only while listening/thinking. While the assistant is
  * preparing or speaking there is no barge-in.
  *
- * Bluetooth: capture without forcing sampleRate, resample to 24 kHz uplink,
- * and route playback to the output that shares groupId with the mic.
+ * Bluetooth speakers (A2DP): mic capture uses a silent AudioContext sink so
+ * it never steals the OS output path; input prefers the built-in mic unless
+ * the user explicitly picks a headset mic (HFP would drop A2DP).
  */
 export class RealtimeVoiceRuntime {
   readonly events = new EventBus<RuntimeEvents>();
@@ -95,18 +97,19 @@ export class RealtimeVoiceRuntime {
       this.setLlm(LlmStatus.Connecting);
       this.setTts(TtsStatus.Connecting);
 
-      // Unlock AudioContext + mic inside the Start click gesture (mobile).
-      await Promise.all([
-        this.speaker.enqueue({
-          pcm: new Int16Array(240),
-          sampleRate: AUDIO_SAMPLE_RATE,
-          timestamp: performance.now(),
-        }),
-        this.mic.start(this.preferredInputId),
-        this.transport.connect(),
-      ]);
+      // Unlock speaker first on the OS default sink (same path as YouTube).
+      // Then open mic on a non-BT input so we never force HFP/SCO.
+      await this.speaker.enqueue({
+        pcm: new Int16Array(240),
+        sampleRate: AUDIO_SAMPLE_RATE,
+        timestamp: performance.now(),
+      });
 
-      await this.applyAudioRouting({ forceInput: false });
+      await this.mic.start(this.preferredInputId);
+      await this.transport.connect();
+
+      // After permission + labels: force built-in mic if OS handed us BT HFP.
+      await this.applyAudioRouting({ forceInput: true });
       this.watchDeviceChanges();
 
       this.setMic(MicStatus.Capturing);
@@ -278,8 +281,9 @@ export class RealtimeVoiceRuntime {
   }
 
   /**
-   * Prefer Bluetooth (or user pick), keep mic + speaker on the same headset
-   * via MediaDeviceInfo.groupId, and setSinkId for playback.
+   * Keep mic on a safe (non-BT) input unless the user picked a headset mic.
+   * Leave speaker on the system default unless the user picked an output —
+   * that matches YouTube/OS Bluetooth A2DP and avoids profile renegotiation.
    */
   private async applyAudioRouting(opts: {
     forceInput: boolean;
@@ -288,29 +292,34 @@ export class RealtimeVoiceRuntime {
     this.routing = true;
     try {
       const { inputs, outputs } = await listAudioDevices();
-      const preferredInput = pickPreferredInput(inputs, this.preferredInputId);
+      const safeInput = pickSafeInput(inputs, this.preferredInputId);
       const activeId = this.mic.activeDeviceId;
-      const shouldSwitchInput =
-        Boolean(preferredInput) &&
-        (opts.forceInput ||
-          (preferredInput &&
-            preferredInput.deviceId !== activeId &&
-            // Auto-switch to BT when OS still held the built-in mic.
-            (Boolean(this.preferredInputId) ||
-              /bluetooth|airpods|buds|headset/i.test(preferredInput.label))));
+      const active = findInputById(inputs, activeId);
 
-      if (shouldSwitchInput && preferredInput) {
-        await this.mic.setDevice(preferredInput.deviceId);
+      const onUnwantedBtMic =
+        !this.preferredInputId &&
+        Boolean(active && isBluetoothLabel(active.label));
+
+      const shouldSwitchInput =
+        Boolean(safeInput) &&
+        safeInput!.deviceId !== activeId &&
+        (opts.forceInput ||
+          onUnwantedBtMic ||
+          Boolean(this.preferredInputId));
+
+      if (shouldSwitchInput && safeInput) {
+        await this.mic.setDevice(safeInput.deviceId);
       }
 
       const inputAfter =
-        findInputById(inputs, this.mic.activeDeviceId) ?? preferredInput;
+        findInputById(inputs, this.mic.activeDeviceId) ?? safeInput;
       const output = pickMatchingOutput(
         outputs,
         inputAfter,
         this.preferredOutputId,
       );
 
+      // undefined → system default sink (OS already routes to BT speaker).
       await this.speaker.setOutputDevice(output?.deviceId);
       this.emitAudioRoute(inputAfter, output);
     } catch (error) {
@@ -328,16 +337,23 @@ export class RealtimeVoiceRuntime {
       inputId: input?.deviceId,
       inputLabel: input?.label,
       outputId: output?.deviceId,
-      outputLabel: output?.label,
+      outputLabel: output?.label ?? "Mặc định hệ thống",
     });
   }
 
   private watchDeviceChanges(): void {
     if (typeof navigator === "undefined" || !navigator.mediaDevices) return;
     this.unwatchDeviceChanges();
+    let timer: ReturnType<typeof setTimeout> | null = null;
     this.deviceChangeHandler = () => {
       if (!this.started) return;
-      void this.applyAudioRouting({ forceInput: false });
+      // Debounce — BT profile flaps fire many devicechange events.
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        if (!this.started) return;
+        void this.applyAudioRouting({ forceInput: true });
+      }, 400);
     };
     navigator.mediaDevices.addEventListener(
       "devicechange",

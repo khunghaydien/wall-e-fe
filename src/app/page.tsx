@@ -66,7 +66,7 @@ export default function Home() {
                 value={selectedInputId}
                 onChange={(value) => void selectInput(value)}
               >
-                <option value="">Tự chọn (ưu tiên Bluetooth)</option>
+                <option value="">Mic máy (tránh Bluetooth)</option>
                 {inputs.map((device) => (
                   <option key={device.deviceId} value={device.deviceId}>
                     {device.label}
@@ -80,7 +80,7 @@ export default function Home() {
                 value={selectedOutputId}
                 onChange={(value) => void selectOutput(value)}
               >
-                <option value="">Ghép theo micro (cùng Bluetooth)</option>
+                <option value="">Loa mặc định hệ thống</option>
                 {outputs.map((device) => (
                   <option key={device.deviceId} value={device.deviceId}>
                     {device.label}

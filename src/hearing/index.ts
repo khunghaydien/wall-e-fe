@@ -5,6 +5,7 @@ export {
   unlockAudioDeviceLabels,
   listAudioDevices,
   isBluetoothLabel,
+  pickSafeInput,
   pickPreferredInput,
   pickMatchingOutput,
   findInputById,
