@@ -283,10 +283,12 @@ export class SpeakerPlayer {
   private async ensureContext(): Promise<void> {
     if (typeof window === "undefined") return;
     if (!this.context) {
-      const options: AudioContextOptions & { sinkId?: string } = {};
+      const options: AudioContextOptions & { sinkId?: string } = {
+        latencyHint: "playback",
+      };
       if (this.sinkId) options.sinkId = this.sinkId;
       this.context = new AudioContext(options);
-      await this.applySinkId(this.context);
+      if (this.sinkId) await this.applySinkId(this.context);
     }
     if (!this.masterGain) {
       this.masterGain = this.context.createGain();
@@ -298,13 +300,13 @@ export class SpeakerPlayer {
   }
 
   private async applySinkId(context: AudioContext): Promise<void> {
+    if (!this.sinkId) return;
     const ctx = context as AudioContext & {
       setSinkId?: (id: string) => Promise<void>;
     };
     if (typeof ctx.setSinkId !== "function") return;
     try {
-      // Empty string = OS default output (YouTube path / BT A2DP).
-      await ctx.setSinkId(this.sinkId ?? "");
+      await ctx.setSinkId(this.sinkId);
     } catch (error) {
       console.warn("[speaker] setSinkId failed — using system default output", error);
     }

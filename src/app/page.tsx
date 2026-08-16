@@ -105,8 +105,8 @@ export default function Home() {
               {outputs.length === 0 ? (
                 <p className="text-[11px] leading-relaxed text-muted">
                   {outputPickerSupported
-                    ? "Điện thoại: để “Tự động” — Android tự gắn Bluetooth. Chỉ bấm “Chọn loa” nếu muốn chỉ định loa."
-                    : "Điện thoại: âm thanh theo Bluetooth hệ thống khi đã kết nối headset."}
+                    ? "Điện thoại: để Tự động, Start — không chọn mic Bluetooth trong list (Android sẽ tự giữ loa BT)."
+                    : "Điện thoại: kết nối loa Bluetooth ở hệ thống rồi Start, để Tự động."}
                 </p>
               ) : null}
             </label>

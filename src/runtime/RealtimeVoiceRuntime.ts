@@ -100,8 +100,8 @@ export class RealtimeVoiceRuntime {
       this.setLlm(LlmStatus.Connecting);
       this.setTts(TtsStatus.Connecting);
 
-      // Unlock speaker, then open mic. Soft BT constraints by default — routing
-      // will auto-switch onto Bluetooth mic/speaker when the OS exposes them.
+      // Unlock speaker first (playback / A2DP), then open mic.
+      // Phone: no deviceId + no AEC so Android does not switch to SCO/HFP.
       await this.speaker.enqueue({
         pcm: new Int16Array(240),
         sampleRate: AUDIO_SAMPLE_RATE,
@@ -111,16 +111,15 @@ export class RealtimeVoiceRuntime {
       // Soft BT constraints. On phone, omit deviceId so the OS keeps the
       // connected headset (explicit deviceId remounts are what kick BT out).
       const mobile = isMobileBrowser();
-      // Phone + auto: no deviceId (OS keeps BT). Phone + user pick: honor pick.
       await this.mic.start(
         mobile && !this.preferredInputId ? undefined : this.preferredInputId,
-        { bluetooth: true },
+        { bluetooth: true, mobile },
       );
       await this.transport.connect();
 
       await this.applyAudioRouting({ forceInput: !mobile });
-      this.watchDeviceChanges();
-      this.watchMicTrackEnded();
+      if (!mobile) this.watchDeviceChanges();
+      if (!mobile) this.watchMicTrackEnded();
 
       this.setMic(MicStatus.Capturing);
       this.setLlm(LlmStatus.Idle);
@@ -341,12 +340,13 @@ export class RealtimeVoiceRuntime {
       if (this.mic.activeDeviceId !== preferred.deviceId || !this.mic.isLive) {
         await this.mic.setDevice(preferred.deviceId, {
           bluetooth: isBluetoothLabel(preferred.label),
+          mobile: true,
         });
         this.micRetryAttempt = 0;
       }
     } else if (!this.mic.isLive) {
-      // Remount on OS default only if the track died — no deviceId.
-      await this.mic.setDevice(undefined, { bluetooth: true });
+      // Dead track only — remounting a live stream is what kicks BT on phones.
+      await this.mic.setDevice(undefined, { bluetooth: true, mobile: true });
       this.micRetryAttempt = 0;
     }
 
@@ -432,7 +432,7 @@ export class RealtimeVoiceRuntime {
       this.micRetryTimer = null;
       if (!this.started) return;
       if (mobileDefault && !this.preferredInputId) {
-        void this.mic.setDevice(undefined, { bluetooth: true }).then(() => {
+        void this.mic.setDevice(undefined, { bluetooth: true, mobile: true }).then(() => {
           void this.applyAudioRouting({ forceInput: false });
         });
         return;

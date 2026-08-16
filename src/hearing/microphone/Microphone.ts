@@ -12,6 +12,11 @@ export type MicrophoneOptions = {
 export type OpenCaptureOptions = {
   /** Softer getUserMedia constraints — required for stable Bluetooth HFP/SCO. */
   bluetooth?: boolean;
+  /**
+   * Phone browsers: disable WebRTC DSP so Android stays on A2DP (media)
+   * instead of HFP/SCO (call). Echo cancel is less needed in half-duplex.
+   */
+  mobile?: boolean;
 };
 
 type AudioContextWithSink = AudioContext & {
@@ -93,13 +98,9 @@ export class Microphone {
     this.deviceId = deviceId;
     if (!this.started) return;
 
-    if (
-      deviceId &&
-      this.isLive &&
-      this.activeDeviceId === deviceId &&
-      !this.opening
-    ) {
-      return;
+    if (this.isLive && !this.opening) {
+      if (!deviceId) return;
+      if (this.activeDeviceId === deviceId) return;
     }
 
     await this.openCapture(deviceId, capture);
@@ -117,7 +118,7 @@ export class Microphone {
   ): Promise<void> {
     const generation = ++this.openGeneration;
     this.opening = true;
-    this.bluetoothMode = Boolean(capture.bluetooth);
+    this.bluetoothMode = Boolean(capture.bluetooth || capture.mobile);
 
     try {
       const hadStream = Boolean(this.stream);
@@ -132,7 +133,9 @@ export class Microphone {
       try {
         this.stream = await this.getStream(deviceId, {
           bluetooth: this.bluetoothMode,
-          exactDevice: !this.bluetoothMode && Boolean(deviceId),
+          mobile: Boolean(capture.mobile),
+          exactDevice:
+            !this.bluetoothMode && !capture.mobile && Boolean(deviceId),
         });
       } catch (error) {
         if (!deviceId) throw error;
@@ -142,6 +145,7 @@ export class Microphone {
         if (generation !== this.openGeneration) return;
         this.stream = await this.getStream(deviceId, {
           bluetooth: true,
+          mobile: Boolean(capture.mobile),
           exactDevice: false,
         });
       }
@@ -154,8 +158,13 @@ export class Microphone {
 
       this.bindTrackEnded(this.stream);
 
-      this.context = new AudioContext() as AudioContextWithSink;
-      await this.applySilentSink(this.context);
+      this.context = new AudioContext({
+        latencyHint: capture.mobile ? "playback" : "interactive",
+      }) as AudioContextWithSink;
+      // setSinkId("none") on Android can steal the BT A2DP route — desktop only.
+      if (!capture.mobile) {
+        await this.applySilentSink(this.context);
+      }
       if (this.context.state === "suspended") {
         await this.context.resume();
       }
@@ -211,18 +220,29 @@ export class Microphone {
 
   private async getStream(
     deviceId: string | undefined,
-    opts: { bluetooth: boolean; exactDevice: boolean },
+    opts: { bluetooth: boolean; exactDevice: boolean; mobile: boolean },
   ): Promise<MediaStream> {
-    const audio: MediaTrackConstraints = {
-      channelCount: { ideal: this.options.channelCount },
-    };
+    const audio: MediaTrackConstraints = {};
 
-    if (opts.bluetooth) {
-      // Soft DSP only — hard true/false often renegotiates and drops HFP.
+    if (opts.mobile) {
+      // Chrome Android turns AEC on → MODE_IN_COMMUNICATION → SCO, which
+      // disconnects A2DP-only Bluetooth speakers. Half-duplex does not need AEC.
+      audio.echoCancellation = false;
+      audio.noiseSuppression = false;
+      audio.autoGainControl = false;
+      Object.assign(audio, {
+        googEchoCancellation: false,
+        googAutoGainControl: false,
+        googNoiseSuppression: false,
+        googHighpassFilter: false,
+      });
+    } else if (opts.bluetooth) {
+      audio.channelCount = { ideal: this.options.channelCount };
       audio.echoCancellation = { ideal: true };
       audio.noiseSuppression = { ideal: false };
       audio.autoGainControl = { ideal: true };
     } else {
+      audio.channelCount = { ideal: this.options.channelCount };
       audio.echoCancellation = true;
       audio.noiseSuppression = true;
       audio.autoGainControl = true;
