@@ -66,7 +66,7 @@ export default function Home() {
                 value={selectedInputId}
                 onChange={(value) => void selectInput(value)}
               >
-                <option value="">Mic máy (tránh Bluetooth)</option>
+                <option value="">Mic máy (mặc định)</option>
                 {inputs.map((device) => (
                   <option key={device.deviceId} value={device.deviceId}>
                     {device.label}

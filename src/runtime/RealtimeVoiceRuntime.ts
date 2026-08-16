@@ -74,6 +74,8 @@ export class RealtimeVoiceRuntime {
   private preferredOutputId: string | undefined;
   private deviceChangeHandler: (() => void) | null = null;
   private routing = false;
+  private micRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private micRetryAttempt = 0;
 
   getAudioDevices(): Promise<AudioDeviceLists> {
     return listAudioDevices();
@@ -105,12 +107,16 @@ export class RealtimeVoiceRuntime {
         timestamp: performance.now(),
       });
 
-      await this.mic.start(this.preferredInputId);
+      await this.mic.start(this.preferredInputId, {
+        // Soft constraints whenever user locked a device (often BT headset).
+        bluetooth: Boolean(this.preferredInputId),
+      });
       await this.transport.connect();
 
-      // After permission + labels: force built-in mic if OS handed us BT HFP.
+      // After permission + labels: keep user BT mic if chosen; else leave built-in.
       await this.applyAudioRouting({ forceInput: true });
       this.watchDeviceChanges();
+      this.watchMicTrackEnded();
 
       this.setMic(MicStatus.Capturing);
       this.setLlm(LlmStatus.Idle);
@@ -281,34 +287,65 @@ export class RealtimeVoiceRuntime {
   }
 
   /**
-   * Keep mic on a safe (non-BT) input unless the user picked a headset mic.
-   * Leave speaker on the system default unless the user picked an output —
-   * that matches YouTube/OS Bluetooth A2DP and avoids profile renegotiation.
+   * Mic routing:
+   * - User-picked device (incl. Bluetooth) is sticky — never fall back to
+   *   built-in while that id is preferred (fallback is what kicks BT out).
+   * - No preference → prefer a non-BT / non-communications mic.
+   * Speaker stays on OS default unless the user picked an output.
    */
   private async applyAudioRouting(opts: {
     forceInput: boolean;
+    fromDeviceChange?: boolean;
   }): Promise<void> {
-    if (this.routing) return;
+    if (this.routing || this.mic.isOpening) return;
     this.routing = true;
     try {
       const { inputs, outputs } = await listAudioDevices();
-      const safeInput = pickSafeInput(inputs, this.preferredInputId);
+
+      if (this.preferredInputId) {
+        const preferred = findInputById(inputs, this.preferredInputId);
+        if (!preferred) {
+          // BT HFP often vanishes briefly mid-handshake — wait, don't remount.
+          if (!opts.fromDeviceChange) {
+            this.scheduleMicRetry();
+          }
+          this.emitAudioRoute(
+            findInputById(inputs, this.mic.activeDeviceId),
+            pickMatchingOutput(outputs, undefined, this.preferredOutputId),
+          );
+          return;
+        }
+
+        const bluetooth = isBluetoothLabel(preferred.label);
+        if (this.mic.activeDeviceId !== preferred.deviceId || !this.mic.isLive) {
+          await this.mic.setDevice(preferred.deviceId, { bluetooth });
+          this.micRetryAttempt = 0;
+        }
+
+        const output = pickMatchingOutput(
+          outputs,
+          preferred,
+          this.preferredOutputId,
+        );
+        await this.speaker.setOutputDevice(output?.deviceId);
+        this.emitAudioRoute(preferred, output);
+        return;
+      }
+
+      const safeInput = pickSafeInput(inputs, undefined);
       const activeId = this.mic.activeDeviceId;
       const active = findInputById(inputs, activeId);
-
-      const onUnwantedBtMic =
-        !this.preferredInputId &&
-        Boolean(active && isBluetoothLabel(active.label));
+      const onUnwantedBtMic = Boolean(
+        active && isBluetoothLabel(active.label),
+      );
 
       const shouldSwitchInput =
         Boolean(safeInput) &&
         safeInput!.deviceId !== activeId &&
-        (opts.forceInput ||
-          onUnwantedBtMic ||
-          Boolean(this.preferredInputId));
+        (opts.forceInput || onUnwantedBtMic);
 
       if (shouldSwitchInput && safeInput) {
-        await this.mic.setDevice(safeInput.deviceId);
+        await this.mic.setDevice(safeInput.deviceId, { bluetooth: false });
       }
 
       const inputAfter =
@@ -318,8 +355,6 @@ export class RealtimeVoiceRuntime {
         inputAfter,
         this.preferredOutputId,
       );
-
-      // undefined → system default sink (OS already routes to BT speaker).
       await this.speaker.setOutputDevice(output?.deviceId);
       this.emitAudioRoute(inputAfter, output);
     } catch (error) {
@@ -327,6 +362,25 @@ export class RealtimeVoiceRuntime {
     } finally {
       this.routing = false;
     }
+  }
+
+  private watchMicTrackEnded(): void {
+    this.mic.onTrackEnded(() => {
+      if (!this.started || !this.preferredInputId) return;
+      this.scheduleMicRetry();
+    });
+  }
+
+  private scheduleMicRetry(): void {
+    if (this.micRetryTimer) clearTimeout(this.micRetryTimer);
+    if (this.micRetryAttempt >= 5) return;
+    const delay = 500 + this.micRetryAttempt * 400;
+    this.micRetryAttempt += 1;
+    this.micRetryTimer = setTimeout(() => {
+      this.micRetryTimer = null;
+      if (!this.started || !this.preferredInputId) return;
+      void this.applyAudioRouting({ forceInput: true });
+    }, delay);
   }
 
   private emitAudioRoute(
@@ -346,14 +400,17 @@ export class RealtimeVoiceRuntime {
     this.unwatchDeviceChanges();
     let timer: ReturnType<typeof setTimeout> | null = null;
     this.deviceChangeHandler = () => {
-      if (!this.started) return;
+      if (!this.started || this.mic.isOpening || this.routing) return;
       // Debounce — BT profile flaps fire many devicechange events.
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
         timer = null;
-        if (!this.started) return;
-        void this.applyAudioRouting({ forceInput: true });
-      }, 400);
+        if (!this.started || this.mic.isOpening) return;
+        void this.applyAudioRouting({
+          forceInput: false,
+          fromDeviceChange: true,
+        });
+      }, 700);
     };
     navigator.mediaDevices.addEventListener(
       "devicechange",
@@ -406,6 +463,11 @@ export class RealtimeVoiceRuntime {
 
   private async teardown(): Promise<void> {
     this.unwatchDeviceChanges();
+    if (this.micRetryTimer) {
+      clearTimeout(this.micRetryTimer);
+      this.micRetryTimer = null;
+    }
+    this.micRetryAttempt = 0;
     this.listenEpoch += 1;
     this.userSpeaking = false;
     this.responseDone = true;

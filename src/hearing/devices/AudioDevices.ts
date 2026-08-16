@@ -96,26 +96,20 @@ export function pickPreferredInput(
 /**
  * Output routing:
  * - User pick → that device (setSinkId)
- * - Mic is an explicit BT headset → same groupId speaker
- * - Otherwise → system default (undefined), same as YouTube / OS BT speaker
+ * - Otherwise → system default (undefined)
+ *
+ * Do NOT auto-match BT headset speaker by groupId while opening the BT mic —
+ * dual setSinkId + getUserMedia during HFP handshake is what kicks the link.
  */
 export function pickMatchingOutput(
   outputs: AudioDeviceInfo[],
-  input?: AudioDeviceInfo,
+  _input?: AudioDeviceInfo,
   preferredId?: string,
 ): AudioDeviceInfo | undefined {
   if (preferredId) {
     const exact = outputs.find((d) => d.deviceId === preferredId);
     if (exact) return exact;
   }
-
-  if (input && isBluetoothLabel(input.label) && input.groupId) {
-    const matched = outputs.find(
-      (d) => d.groupId === input.groupId && d.deviceId.length > 0,
-    );
-    if (matched) return matched;
-  }
-
   return undefined;
 }
 
