@@ -18,7 +18,7 @@ import {
   type AudioDeviceLists,
 } from "@/hearing";
 import { base64ToInt16 } from "@/protocol";
-import { SpeakerPlayer } from "@/speaking";
+import { SpeakerPlayer, MediaRouteHold } from "@/speaking";
 import { TransportClient } from "@/transport";
 import { float32ToInt16, isMobileBrowser } from "@/utils";
 import { EventBus } from "./EventBus";
@@ -61,6 +61,7 @@ export class RealtimeVoiceRuntime {
   });
   private readonly transport = new TransportClient();
   private readonly speaker = new SpeakerPlayer();
+  private readonly mediaHold = new MediaRouteHold();
 
   private started = false;
   private bound = false;
@@ -100,21 +101,23 @@ export class RealtimeVoiceRuntime {
       this.setLlm(LlmStatus.Connecting);
       this.setTts(TtsStatus.Connecting);
 
-      // Unlock speaker first (playback / A2DP), then open mic.
-      // Phone: no deviceId + no AEC so Android does not switch to SCO/HFP.
-      await this.speaker.enqueue({
-        pcm: new Int16Array(240),
-        sampleRate: AUDIO_SAMPLE_RATE,
-        timestamp: performance.now(),
-      });
-
-      // Soft BT constraints. On phone, omit deviceId so the OS keeps the
-      // connected headset (explicit deviceId remounts are what kick BT out).
       const mobile = isMobileBrowser();
-      await this.mic.start(
-        mobile && !this.preferredInputId ? undefined : this.preferredInputId,
-        { bluetooth: true, mobile },
-      );
+      if (mobile) {
+        // YouTube path: hold STREAM_MUSIC / A2DP, then open the phone mic
+        // on the same AudioContext. A second context or AEC switches SCO.
+        const playback = await this.speaker.preparePlayback();
+        this.mic.attachContext(playback);
+        await this.mediaHold.start();
+        await sleep(350);
+        await this.mic.start(undefined, { mobile: true });
+      } else {
+        await this.speaker.enqueue({
+          pcm: new Int16Array(240),
+          sampleRate: AUDIO_SAMPLE_RATE,
+          timestamp: performance.now(),
+        });
+        await this.mic.start(this.preferredInputId, { bluetooth: true });
+      }
       await this.transport.connect();
 
       await this.applyAudioRouting({ forceInput: !mobile });
@@ -539,11 +542,10 @@ export class RealtimeVoiceRuntime {
     this.currentAssistantItemId = "";
     this.interruptedItemId = "";
     this.gate = "listening";
-    await Promise.allSettled([
-      this.mic.stop(),
-      Promise.resolve(this.transport.disconnect()),
-      this.speaker.stop(),
-    ]);
+    this.mediaHold.stop();
+    await this.mic.stop();
+    this.transport.disconnect();
+    await this.speaker.stop();
   }
 
   private setGate(phase: TurnPhase): void {
@@ -576,4 +578,8 @@ export class RealtimeVoiceRuntime {
     this.state.setSpeaking(status);
     this.events.emit("speaking:status", status);
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -87,6 +87,23 @@ export class SpeakerPlayer {
     return run;
   }
 
+  /** Shared context so mic capture does not open a second Android audio session. */
+  get audioContext(): AudioContext | null {
+    return this.context;
+  }
+
+  /**
+   * Create the playback graph (media / A2DP) before getUserMedia.
+   * Must run inside a user gesture.
+   */
+  async preparePlayback(): Promise<AudioContext> {
+    await this.ensureContext();
+    if (!this.context) {
+      throw new Error("AudioContext is not available");
+    }
+    return this.context;
+  }
+
   pushStreamFrame(frame: StreamPcmFrame): void {
     const myEpoch = this.epoch;
     void this.pushStreamFrameInner(frame, myEpoch);

@@ -5,16 +5,14 @@ export type MicrophoneOptions = {
   /** Target rate for frames sent to the transport (e.g. 24 kHz). */
   sampleRate: number;
   channelCount: number;
-  /** Prefer this input when available (only when user picks it). */
   deviceId?: string;
 };
 
 export type OpenCaptureOptions = {
-  /** Softer getUserMedia constraints — required for stable Bluetooth HFP/SCO. */
   bluetooth?: boolean;
   /**
-   * Phone browsers: disable WebRTC DSP so Android stays on A2DP (media)
-   * instead of HFP/SCO (call). Echo cancel is less needed in half-duplex.
+   * Phone: disable DSP, reuse the playback AudioContext, never remount a
+   * live track. Opening a second AudioContext / AEC is what drops A2DP.
    */
   mobile?: boolean;
 };
@@ -25,23 +23,18 @@ type AudioContextWithSink = AudioContext & {
 
 const BT_SETTLE_MS = 350;
 
-/**
- * Captures mono PCM via getUserMedia with browser DSP.
- *
- * Bluetooth HFP mics drop if we remount the stream, use `exact` deviceId, or
- * pile on echoCancellation/noiseSuppression during profile handshake.
- * Capture AudioContext stays on a silent sink so it never steals A2DP output.
- */
 export class Microphone {
   private stream: MediaStream | null = null;
   private context: AudioContextWithSink | null = null;
+  private ownedContext = true;
   private processor: ScriptProcessorNode | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
-  private discard: MediaStreamAudioDestinationNode | null = null;
+  private discard: AudioNode | null = null;
   private onFrameCallback: ((frame: AudioFrame) => void) | null = null;
   private onTrackEndedCallback: (() => void) | null = null;
   private deviceId: string | undefined;
   private bluetoothMode = false;
+  private mobileMode = false;
   private started = false;
   private opening = false;
   private openGeneration = 0;
@@ -55,9 +48,14 @@ export class Microphone {
     this.onFrameCallback = callback;
   }
 
-  /** Fired when the OS ends the track (common during BT HFP flaps). */
   onTrackEnded(callback: () => void): void {
     this.onTrackEndedCallback = callback;
+  }
+
+  /** Reuse the speaker AudioContext (required on Android). */
+  attachContext(context: AudioContext): void {
+    this.context = context as AudioContextWithSink;
+    this.ownedContext = false;
   }
 
   get activeDeviceId(): string | undefined {
@@ -87,10 +85,6 @@ export class Microphone {
     this.started = true;
   }
 
-  /**
-   * Hot-swap input. No-ops when already live on the same device — reopening
-   * is what kicks Bluetooth HFP offline.
-   */
   async setDevice(
     deviceId: string | undefined,
     capture: OpenCaptureOptions = {},
@@ -118,13 +112,13 @@ export class Microphone {
   ): Promise<void> {
     const generation = ++this.openGeneration;
     this.opening = true;
+    this.mobileMode = Boolean(capture.mobile);
     this.bluetoothMode = Boolean(capture.bluetooth || capture.mobile);
 
     try {
       const hadStream = Boolean(this.stream);
       await this.closeCapture();
 
-      // Let the previous device release before claiming BT HFP/SCO.
       if (hadStream) {
         await sleep(BT_SETTLE_MS);
         if (generation !== this.openGeneration) return;
@@ -133,19 +127,16 @@ export class Microphone {
       try {
         this.stream = await this.getStream(deviceId, {
           bluetooth: this.bluetoothMode,
-          mobile: Boolean(capture.mobile),
-          exactDevice:
-            !this.bluetoothMode && !capture.mobile && Boolean(deviceId),
+          mobile: this.mobileMode,
+          exactDevice: !this.mobileMode && !this.bluetoothMode && Boolean(deviceId),
         });
       } catch (error) {
         if (!deviceId) throw error;
-        // Soft retry on the same device — never fall back to built-in while
-        // the user asked for this mic (fallback is what "outs" Bluetooth).
         await sleep(BT_SETTLE_MS);
         if (generation !== this.openGeneration) return;
         this.stream = await this.getStream(deviceId, {
           bluetooth: true,
-          mobile: Boolean(capture.mobile),
+          mobile: this.mobileMode,
           exactDevice: false,
         });
       }
@@ -156,24 +147,23 @@ export class Microphone {
         return;
       }
 
+      await this.disableCaptureProcessing(this.stream);
       this.bindTrackEnded(this.stream);
 
-      this.context = new AudioContext({
-        latencyHint: capture.mobile ? "playback" : "interactive",
-      }) as AudioContextWithSink;
-      // setSinkId("none") on Android can steal the BT A2DP route — desktop only.
-      if (!capture.mobile) {
-        await this.applySilentSink(this.context);
+      if (!this.context) {
+        this.context = new AudioContext({
+          latencyHint: this.mobileMode ? "playback" : "interactive",
+        }) as AudioContextWithSink;
+        this.ownedContext = true;
+        if (!this.mobileMode) await this.applySilentSink(this.context);
       }
       if (this.context.state === "suspended") {
         await this.context.resume();
       }
 
       this.source = this.context.createMediaStreamSource(this.stream);
-      this.discard = this.context.createMediaStreamDestination();
 
-      // Larger buffer absorbs SCO jitter on Bluetooth headsets.
-      const bufferSize = this.bluetoothMode ? 4096 : 2048;
+      const bufferSize = this.mobileMode || this.bluetoothMode ? 4096 : 2048;
       this.processor = this.context.createScriptProcessor(bufferSize, 1, 1);
       this.processor.onaudioprocess = (event) => {
         const input = event.inputBuffer.getChannelData(0);
@@ -191,11 +181,35 @@ export class Microphone {
       };
 
       this.source.connect(this.processor);
-      this.processor.connect(this.discard);
+      if (this.mobileMode) {
+        const mute = this.context.createGain();
+        mute.gain.value = 0;
+        this.discard = mute;
+        this.processor.connect(mute);
+        mute.connect(this.context.destination);
+      } else {
+        const dest = this.context.createMediaStreamDestination();
+        this.discard = dest;
+        this.processor.connect(dest);
+      }
     } finally {
       if (generation === this.openGeneration) {
         this.opening = false;
       }
+    }
+  }
+
+  private async disableCaptureProcessing(stream: MediaStream): Promise<void> {
+    const track = stream.getAudioTracks()[0];
+    if (!track || !this.mobileMode) return;
+    try {
+      await track.applyConstraints({
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      });
+    } catch {
+      // Device may reject — capture still runs with initial constraints.
     }
   }
 
@@ -214,7 +228,7 @@ export class Microphone {
     try {
       await context.setSinkId({ type: "none" });
     } catch {
-      // MediaStreamDestination still avoids claiming speakers.
+      // ignore
     }
   }
 
@@ -225,16 +239,18 @@ export class Microphone {
     const audio: MediaTrackConstraints = {};
 
     if (opts.mobile) {
-      // Chrome Android turns AEC on → MODE_IN_COMMUNICATION → SCO, which
-      // disconnects A2DP-only Bluetooth speakers. Half-duplex does not need AEC.
+      // Media-path capture: stereo 48 kHz, no DSP → Android STREAM_MUSIC.
       audio.echoCancellation = false;
       audio.noiseSuppression = false;
       audio.autoGainControl = false;
+      audio.channelCount = { ideal: 2 };
+      audio.sampleRate = { ideal: 48_000 };
       Object.assign(audio, {
         googEchoCancellation: false,
         googAutoGainControl: false,
         googNoiseSuppression: false,
         googHighpassFilter: false,
+        googTypingNoiseDetection: false,
       });
     } else if (opts.bluetooth) {
       audio.channelCount = { ideal: this.options.channelCount };
@@ -274,8 +290,10 @@ export class Microphone {
     this.discard?.disconnect();
     this.discard = null;
 
-    await this.context?.close().catch(() => undefined);
-    this.context = null;
+    if (this.ownedContext) {
+      await this.context?.close().catch(() => undefined);
+      this.context = null;
+    }
 
     this.stream?.getTracks().forEach((t) => t.stop());
     this.stream = null;
