@@ -19,6 +19,8 @@ export default function Home() {
     refreshDevices,
     selectInput,
     selectOutput,
+    pickSpeaker,
+    outputPickerSupported,
   } = useVoiceRuntime();
   const isRunning = state.runtime === RuntimeStatus.Running;
   const levelPct = Math.round(Math.min(1, state.micLevel) * 100);
@@ -66,7 +68,7 @@ export default function Home() {
                 value={selectedInputId}
                 onChange={(value) => void selectInput(value)}
               >
-                <option value="">Mic máy (mặc định)</option>
+                <option value="">Tự động (ưu tiên Bluetooth)</option>
                 {inputs.map((device) => (
                   <option key={device.deviceId} value={device.deviceId}>
                     {device.label}
@@ -76,17 +78,37 @@ export default function Home() {
             </label>
             <label className="flex flex-col gap-1.5">
               <span className="text-muted text-xs">Loa / tai nghe</span>
-              <DeviceSelect
-                value={selectedOutputId}
-                onChange={(value) => void selectOutput(value)}
-              >
-                <option value="">Loa mặc định hệ thống</option>
-                {outputs.map((device) => (
-                  <option key={device.deviceId} value={device.deviceId}>
-                    {device.label}
-                  </option>
-                ))}
-              </DeviceSelect>
+              <div className="flex gap-2">
+                <div className="min-w-0 flex-1">
+                  <DeviceSelect
+                    value={selectedOutputId}
+                    onChange={(value) => void selectOutput(value)}
+                  >
+                    <option value="">Tự động (ưu tiên Bluetooth)</option>
+                    {outputs.map((device) => (
+                      <option key={device.deviceId} value={device.deviceId}>
+                        {device.label}
+                      </option>
+                    ))}
+                  </DeviceSelect>
+                </div>
+                {outputPickerSupported ? (
+                  <button
+                    type="button"
+                    onClick={() => void pickSpeaker()}
+                    className="shrink-0 rounded-lg border border-border px-3 py-2.5 text-xs text-muted hover:text-foreground"
+                  >
+                    Chọn loa
+                  </button>
+                ) : null}
+              </div>
+              {outputs.length === 0 ? (
+                <p className="text-[11px] leading-relaxed text-muted">
+                  {outputPickerSupported
+                    ? "Android/Chrome không hiện loa Bluetooth trong list — bấm “Chọn loa” để mở picker hệ thống."
+                    : "Trình duyệt không liệt kê loa. Âm thanh theo loa mặc định của máy (Media/BT trong cài đặt Android)."}
+                </p>
+              ) : null}
             </label>
           </div>
           {(route.inputLabel || route.outputLabel) && (

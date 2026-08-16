@@ -4,6 +4,8 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "
 import {
   listAudioDevices,
   unlockAudioDeviceLabels,
+  canSelectAudioOutput,
+  pickAudioOutputDevice,
   type AudioDeviceInfo,
 } from "@/hearing";
 import { VoiceRuntime } from "@/runtime";
@@ -24,6 +26,7 @@ export function useVoiceRuntime() {
   const [selectedInputId, setSelectedInputId] = useState("");
   const [selectedOutputId, setSelectedOutputId] = useState("");
   const [route, setRoute] = useState<AudioRouteUi>({});
+  const [outputPickerSupported, setOutputPickerSupported] = useState(false);
 
   const snapshot = useSyncExternalStore(
     runtimeStore.subscribe,
@@ -46,6 +49,7 @@ export function useVoiceRuntime() {
   }, []);
 
   useEffect(() => {
+    setOutputPickerSupported(canSelectAudioOutput());
     const runtime = new VoiceRuntime();
     runtimeRef.current = runtime;
 
@@ -96,8 +100,7 @@ export function useVoiceRuntime() {
       }),
       runtime.events.on("audio:route", (next) => {
         setRoute(next);
-        if (next.inputId) setSelectedInputId(next.inputId);
-        if (next.outputId) setSelectedOutputId(next.outputId);
+        // Keep dropdown on "" = auto Bluetooth; don't lock to the active device.
         void refreshDevices(false);
       }),
     ];
@@ -163,6 +166,17 @@ export function useVoiceRuntime() {
     });
   }
 
+  /** Android: open system speaker picker so Bluetooth outputs become visible. */
+  async function pickSpeaker(): Promise<void> {
+    const picked = await pickAudioOutputDevice();
+    if (!picked) return;
+    const listed = await refreshDevices(false);
+    if (!listed.outputs.some((d) => d.deviceId === picked.deviceId)) {
+      setOutputs([...listed.outputs, picked]);
+    }
+    await selectOutput(picked.deviceId);
+  }
+
   return {
     state: snapshot as VoiceUiState,
     isBusy,
@@ -176,5 +190,7 @@ export function useVoiceRuntime() {
     refreshDevices,
     selectInput,
     selectOutput,
+    pickSpeaker,
+    outputPickerSupported,
   };
 }

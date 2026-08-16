@@ -4,9 +4,13 @@ export { rootMeanSquare } from "./vad";
 export {
   unlockAudioDeviceLabels,
   listAudioDevices,
+  canSelectAudioOutput,
+  pickAudioOutputDevice,
   isBluetoothLabel,
+  pickAutoInput,
   pickSafeInput,
   pickPreferredInput,
+  pickAutoOutput,
   pickMatchingOutput,
   findInputById,
 } from "./devices";

@@ -11,8 +11,8 @@ import {
   isBluetoothLabel,
   listAudioDevices,
   Microphone,
-  pickMatchingOutput,
-  pickSafeInput,
+  pickAutoInput,
+  pickAutoOutput,
   rootMeanSquare,
   type AudioDeviceInfo,
   type AudioDeviceLists,
@@ -46,9 +46,8 @@ export type AudioRouteSelection = {
  * Mic audio is sent only while listening/thinking. While the assistant is
  * preparing or speaking there is no barge-in.
  *
- * Bluetooth speakers (A2DP): mic capture uses a silent AudioContext sink so
- * it never steals the OS output path; input prefers the built-in mic unless
- * the user explicitly picks a headset mic (HFP would drop A2DP).
+ * Bluetooth speakers/headsets: default routing prefers Bluetooth for both
+ * mic and speaker whenever connected; capture uses a silent AudioContext sink.
  */
 export class RealtimeVoiceRuntime {
   readonly events = new EventBus<RuntimeEvents>();
@@ -99,21 +98,17 @@ export class RealtimeVoiceRuntime {
       this.setLlm(LlmStatus.Connecting);
       this.setTts(TtsStatus.Connecting);
 
-      // Unlock speaker first on the OS default sink (same path as YouTube).
-      // Then open mic on a non-BT input so we never force HFP/SCO.
+      // Unlock speaker, then open mic. Soft BT constraints by default — routing
+      // will auto-switch onto Bluetooth mic/speaker when the OS exposes them.
       await this.speaker.enqueue({
         pcm: new Int16Array(240),
         sampleRate: AUDIO_SAMPLE_RATE,
         timestamp: performance.now(),
       });
 
-      await this.mic.start(this.preferredInputId, {
-        // Soft constraints whenever user locked a device (often BT headset).
-        bluetooth: Boolean(this.preferredInputId),
-      });
+      await this.mic.start(this.preferredInputId, { bluetooth: true });
       await this.transport.connect();
 
-      // After permission + labels: keep user BT mic if chosen; else leave built-in.
       await this.applyAudioRouting({ forceInput: true });
       this.watchDeviceChanges();
       this.watchMicTrackEnded();
@@ -287,11 +282,8 @@ export class RealtimeVoiceRuntime {
   }
 
   /**
-   * Mic routing:
-   * - User-picked device (incl. Bluetooth) is sticky — never fall back to
-   *   built-in while that id is preferred (fallback is what kicks BT out).
-   * - No preference → prefer a non-BT / non-communications mic.
-   * Speaker stays on OS default unless the user picked an output.
+   * Default: auto-route to Bluetooth mic + speaker whenever connected.
+   * Explicit user picks (preferredInputId / preferredOutputId) still win.
    */
   private async applyAudioRouting(opts: {
     forceInput: boolean;
@@ -301,56 +293,44 @@ export class RealtimeVoiceRuntime {
     this.routing = true;
     try {
       const { inputs, outputs } = await listAudioDevices();
+      const targetInput = pickAutoInput(inputs, this.preferredInputId);
 
-      if (this.preferredInputId) {
-        const preferred = findInputById(inputs, this.preferredInputId);
-        if (!preferred) {
-          // BT HFP often vanishes briefly mid-handshake — wait, don't remount.
-          if (!opts.fromDeviceChange) {
-            this.scheduleMicRetry();
-          }
-          this.emitAudioRoute(
-            findInputById(inputs, this.mic.activeDeviceId),
-            pickMatchingOutput(outputs, undefined, this.preferredOutputId),
-          );
-          return;
-        }
-
-        const bluetooth = isBluetoothLabel(preferred.label);
-        if (this.mic.activeDeviceId !== preferred.deviceId || !this.mic.isLive) {
-          await this.mic.setDevice(preferred.deviceId, { bluetooth });
-          this.micRetryAttempt = 0;
-        }
-
-        const output = pickMatchingOutput(
-          outputs,
-          preferred,
-          this.preferredOutputId,
+      if (this.preferredInputId && !targetInput) {
+        // Locked device briefly missing (BT HFP handshake) — retry, don't fall back.
+        if (!opts.fromDeviceChange) this.scheduleMicRetry();
+        this.emitAudioRoute(
+          findInputById(inputs, this.mic.activeDeviceId),
+          pickAutoOutput(outputs, undefined, this.preferredOutputId),
         );
-        await this.speaker.setOutputDevice(output?.deviceId);
-        this.emitAudioRoute(preferred, output);
         return;
       }
 
-      const safeInput = pickSafeInput(inputs, undefined);
+      if (!targetInput) {
+        this.emitAudioRoute(
+          undefined,
+          pickAutoOutput(outputs, undefined, this.preferredOutputId),
+        );
+        return;
+      }
+
+      const bluetooth = isBluetoothLabel(targetInput.label);
       const activeId = this.mic.activeDeviceId;
-      const active = findInputById(inputs, activeId);
-      const onUnwantedBtMic = Boolean(
-        active && isBluetoothLabel(active.label),
-      );
-
       const shouldSwitchInput =
-        Boolean(safeInput) &&
-        safeInput!.deviceId !== activeId &&
-        (opts.forceInput || onUnwantedBtMic);
+        targetInput.deviceId !== activeId ||
+        !this.mic.isLive ||
+        opts.forceInput;
 
-      if (shouldSwitchInput && safeInput) {
-        await this.mic.setDevice(safeInput.deviceId, { bluetooth: false });
+      if (shouldSwitchInput && targetInput.deviceId !== activeId) {
+        await this.mic.setDevice(targetInput.deviceId, { bluetooth });
+        this.micRetryAttempt = 0;
+      } else if (!this.mic.isLive) {
+        await this.mic.setDevice(targetInput.deviceId, { bluetooth });
+        this.micRetryAttempt = 0;
       }
 
       const inputAfter =
-        findInputById(inputs, this.mic.activeDeviceId) ?? safeInput;
-      const output = pickMatchingOutput(
+        findInputById(inputs, this.mic.activeDeviceId) ?? targetInput;
+      const output = pickAutoOutput(
         outputs,
         inputAfter,
         this.preferredOutputId,
@@ -366,7 +346,7 @@ export class RealtimeVoiceRuntime {
 
   private watchMicTrackEnded(): void {
     this.mic.onTrackEnded(() => {
-      if (!this.started || !this.preferredInputId) return;
+      if (!this.started) return;
       this.scheduleMicRetry();
     });
   }
@@ -378,7 +358,7 @@ export class RealtimeVoiceRuntime {
     this.micRetryAttempt += 1;
     this.micRetryTimer = setTimeout(() => {
       this.micRetryTimer = null;
-      if (!this.started || !this.preferredInputId) return;
+      if (!this.started) return;
       void this.applyAudioRouting({ forceInput: true });
     }, delay);
   }
@@ -401,13 +381,13 @@ export class RealtimeVoiceRuntime {
     let timer: ReturnType<typeof setTimeout> | null = null;
     this.deviceChangeHandler = () => {
       if (!this.started || this.mic.isOpening || this.routing) return;
-      // Debounce — BT profile flaps fire many devicechange events.
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
         timer = null;
         if (!this.started || this.mic.isOpening) return;
+        // Re-run auto Bluetooth preference when devices connect/disconnect.
         void this.applyAudioRouting({
-          forceInput: false,
+          forceInput: true,
           fromDeviceChange: true,
         });
       }, 700);

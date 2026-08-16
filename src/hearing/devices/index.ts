@@ -1,9 +1,13 @@
 export {
   unlockAudioDeviceLabels,
   listAudioDevices,
+  canSelectAudioOutput,
+  pickAudioOutputDevice,
   isBluetoothLabel,
+  pickAutoInput,
   pickSafeInput,
   pickPreferredInput,
+  pickAutoOutput,
   pickMatchingOutput,
   findInputById,
 } from "./AudioDevices";
