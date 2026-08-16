@@ -20,7 +20,7 @@ import {
 import { base64ToInt16 } from "@/protocol";
 import { SpeakerPlayer } from "@/speaking";
 import { TransportClient } from "@/transport";
-import { float32ToInt16 } from "@/utils";
+import { float32ToInt16, isMobileBrowser } from "@/utils";
 import { EventBus } from "./EventBus";
 import type { RuntimeEvents } from "./RuntimeEvents";
 import { RuntimeState } from "./RuntimeState";
@@ -46,8 +46,10 @@ export type AudioRouteSelection = {
  * Mic audio is sent only while listening/thinking. While the assistant is
  * preparing or speaking there is no barge-in.
  *
- * Bluetooth speakers/headsets: default routing prefers Bluetooth for both
- * mic and speaker whenever connected; capture uses a silent AudioContext sink.
+ * Bluetooth:
+ * - Desktop (Chrome/Edge Mac): auto-select BT mic + speaker by deviceId.
+ * - Phone: leave mic/speaker on OS default — Android/iOS already route the
+ *   connected headset; chasing deviceId + setSinkId remounts HFP and kicks BT.
  */
 export class RealtimeVoiceRuntime {
   readonly events = new EventBus<RuntimeEvents>();
@@ -106,10 +108,17 @@ export class RealtimeVoiceRuntime {
         timestamp: performance.now(),
       });
 
-      await this.mic.start(this.preferredInputId, { bluetooth: true });
+      // Soft BT constraints. On phone, omit deviceId so the OS keeps the
+      // connected headset (explicit deviceId remounts are what kick BT out).
+      const mobile = isMobileBrowser();
+      // Phone + auto: no deviceId (OS keeps BT). Phone + user pick: honor pick.
+      await this.mic.start(
+        mobile && !this.preferredInputId ? undefined : this.preferredInputId,
+        { bluetooth: true },
+      );
       await this.transport.connect();
 
-      await this.applyAudioRouting({ forceInput: true });
+      await this.applyAudioRouting({ forceInput: !mobile });
       this.watchDeviceChanges();
       this.watchMicTrackEnded();
 
@@ -282,8 +291,8 @@ export class RealtimeVoiceRuntime {
   }
 
   /**
-   * Default: auto-route to Bluetooth mic + speaker whenever connected.
-   * Explicit user picks (preferredInputId / preferredOutputId) still win.
+   * Desktop: auto-route to Bluetooth mic + speaker by deviceId.
+   * Mobile: keep OS default stream/sink — only honor explicit user picks.
    */
   private async applyAudioRouting(opts: {
     forceInput: boolean;
@@ -293,50 +302,14 @@ export class RealtimeVoiceRuntime {
     this.routing = true;
     try {
       const { inputs, outputs } = await listAudioDevices();
-      const targetInput = pickAutoInput(inputs, this.preferredInputId);
+      const mobile = isMobileBrowser();
 
-      if (this.preferredInputId && !targetInput) {
-        // Locked device briefly missing (BT HFP handshake) — retry, don't fall back.
-        if (!opts.fromDeviceChange) this.scheduleMicRetry();
-        this.emitAudioRoute(
-          findInputById(inputs, this.mic.activeDeviceId),
-          pickAutoOutput(outputs, undefined, this.preferredOutputId),
-        );
+      if (mobile) {
+        await this.applyMobileAudioRouting(inputs, outputs, opts);
         return;
       }
 
-      if (!targetInput) {
-        this.emitAudioRoute(
-          undefined,
-          pickAutoOutput(outputs, undefined, this.preferredOutputId),
-        );
-        return;
-      }
-
-      const bluetooth = isBluetoothLabel(targetInput.label);
-      const activeId = this.mic.activeDeviceId;
-      const shouldSwitchInput =
-        targetInput.deviceId !== activeId ||
-        !this.mic.isLive ||
-        opts.forceInput;
-
-      if (shouldSwitchInput && targetInput.deviceId !== activeId) {
-        await this.mic.setDevice(targetInput.deviceId, { bluetooth });
-        this.micRetryAttempt = 0;
-      } else if (!this.mic.isLive) {
-        await this.mic.setDevice(targetInput.deviceId, { bluetooth });
-        this.micRetryAttempt = 0;
-      }
-
-      const inputAfter =
-        findInputById(inputs, this.mic.activeDeviceId) ?? targetInput;
-      const output = pickAutoOutput(
-        outputs,
-        inputAfter,
-        this.preferredOutputId,
-      );
-      await this.speaker.setOutputDevice(output?.deviceId);
-      this.emitAudioRoute(inputAfter, output);
+      await this.applyDesktopAudioRouting(inputs, outputs, opts);
     } catch (error) {
       console.warn("[runtime] audio routing failed", error);
     } finally {
@@ -344,21 +317,126 @@ export class RealtimeVoiceRuntime {
     }
   }
 
+  /**
+   * Phones: the OS already moves default mic/speaker onto Bluetooth when the
+   * headset connects. Remounting with a BT deviceId or setSinkId during that
+   * handshake is what drops the link on Android Chrome.
+   */
+  private async applyMobileAudioRouting(
+    inputs: AudioDeviceInfo[],
+    outputs: AudioDeviceInfo[],
+    opts: { forceInput: boolean; fromDeviceChange?: boolean },
+  ): Promise<void> {
+    // Explicit user mic pick only (dropdown). Never auto-chase BT deviceIds.
+    if (this.preferredInputId) {
+      const preferred = findInputById(inputs, this.preferredInputId);
+      if (!preferred) {
+        if (!opts.fromDeviceChange) this.scheduleMicRetry();
+        this.emitAudioRoute(
+          findInputById(inputs, this.mic.activeDeviceId),
+          this.resolveMobileOutput(outputs),
+        );
+        return;
+      }
+      if (this.mic.activeDeviceId !== preferred.deviceId || !this.mic.isLive) {
+        await this.mic.setDevice(preferred.deviceId, {
+          bluetooth: isBluetoothLabel(preferred.label),
+        });
+        this.micRetryAttempt = 0;
+      }
+    } else if (!this.mic.isLive) {
+      // Remount on OS default only if the track died — no deviceId.
+      await this.mic.setDevice(undefined, { bluetooth: true });
+      this.micRetryAttempt = 0;
+    }
+
+    const inputAfter = findInputById(inputs, this.mic.activeDeviceId);
+    const output = this.resolveMobileOutput(outputs);
+    // Never auto setSinkId on mobile — only when user picked via "Chọn loa".
+    if (this.preferredOutputId) {
+      await this.speaker.setOutputDevice(this.preferredOutputId);
+    }
+    this.emitAudioRoute(inputAfter, output);
+  }
+
+  private resolveMobileOutput(
+    outputs: AudioDeviceInfo[],
+  ): AudioDeviceInfo | undefined {
+    if (this.preferredOutputId) {
+      return outputs.find((d) => d.deviceId === this.preferredOutputId);
+    }
+    return outputs.find((d) => isBluetoothLabel(d.label));
+  }
+
+  private async applyDesktopAudioRouting(
+    inputs: AudioDeviceInfo[],
+    outputs: AudioDeviceInfo[],
+    opts: { forceInput: boolean; fromDeviceChange?: boolean },
+  ): Promise<void> {
+    const targetInput = pickAutoInput(inputs, this.preferredInputId);
+
+    if (this.preferredInputId && !targetInput) {
+      if (!opts.fromDeviceChange) this.scheduleMicRetry();
+      this.emitAudioRoute(
+        findInputById(inputs, this.mic.activeDeviceId),
+        pickAutoOutput(outputs, undefined, this.preferredOutputId),
+      );
+      return;
+    }
+
+    if (!targetInput) {
+      this.emitAudioRoute(
+        undefined,
+        pickAutoOutput(outputs, undefined, this.preferredOutputId),
+      );
+      return;
+    }
+
+    const bluetooth = isBluetoothLabel(targetInput.label);
+    const activeId = this.mic.activeDeviceId;
+
+    if (targetInput.deviceId !== activeId || !this.mic.isLive) {
+      await this.mic.setDevice(targetInput.deviceId, { bluetooth });
+      this.micRetryAttempt = 0;
+    }
+
+    const inputAfter =
+      findInputById(inputs, this.mic.activeDeviceId) ?? targetInput;
+    const output = pickAutoOutput(
+      outputs,
+      inputAfter,
+      this.preferredOutputId,
+    );
+    await this.speaker.setOutputDevice(output?.deviceId);
+    this.emitAudioRoute(inputAfter, output);
+  }
+
   private watchMicTrackEnded(): void {
     this.mic.onTrackEnded(() => {
       if (!this.started) return;
-      this.scheduleMicRetry();
+      // Mobile: OS flaps tracks during HFP — wait longer, remount default only.
+      if (isMobileBrowser()) {
+        this.scheduleMicRetry(true);
+        return;
+      }
+      this.scheduleMicRetry(false);
     });
   }
 
-  private scheduleMicRetry(): void {
+  private scheduleMicRetry(mobileDefault = false): void {
     if (this.micRetryTimer) clearTimeout(this.micRetryTimer);
-    if (this.micRetryAttempt >= 5) return;
-    const delay = 500 + this.micRetryAttempt * 400;
+    if (this.micRetryAttempt >= 4) return;
+    const delay = (mobileDefault ? 900 : 500) + this.micRetryAttempt * 500;
     this.micRetryAttempt += 1;
     this.micRetryTimer = setTimeout(() => {
       this.micRetryTimer = null;
       if (!this.started) return;
+      if (mobileDefault && !this.preferredInputId) {
+        void this.mic.setDevice(undefined, { bluetooth: true }).then(() => {
+          void this.applyAudioRouting({ forceInput: false });
+        });
+        return;
+      }
       void this.applyAudioRouting({ forceInput: true });
     }, delay);
   }
@@ -367,11 +445,16 @@ export class RealtimeVoiceRuntime {
     input?: AudioDeviceInfo,
     output?: AudioDeviceInfo,
   ): void {
+    const mobile = isMobileBrowser();
     this.events.emit("audio:route", {
       inputId: input?.deviceId,
       inputLabel: input?.label,
       outputId: output?.deviceId,
-      outputLabel: output?.label ?? "Mặc định hệ thống",
+      outputLabel:
+        output?.label ??
+        (mobile
+          ? "Hệ thống (Bluetooth nếu Android đang kết nối)"
+          : "Mặc định hệ thống"),
     });
   }
 
@@ -382,15 +465,17 @@ export class RealtimeVoiceRuntime {
     this.deviceChangeHandler = () => {
       if (!this.started || this.mic.isOpening || this.routing) return;
       if (timer) clearTimeout(timer);
+      const mobile = isMobileBrowser();
       timer = setTimeout(() => {
         timer = null;
         if (!this.started || this.mic.isOpening) return;
-        // Re-run auto Bluetooth preference when devices connect/disconnect.
+        // Mobile: never force remount on devicechange — only refresh labels /
+        // recover a dead track. Desktop still auto-chases Bluetooth.
         void this.applyAudioRouting({
-          forceInput: true,
+          forceInput: !mobile,
           fromDeviceChange: true,
         });
-      }, 700);
+      }, mobile ? 1200 : 700);
     };
     navigator.mediaDevices.addEventListener(
       "devicechange",

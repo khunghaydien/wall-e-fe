@@ -105,8 +105,8 @@ export default function Home() {
               {outputs.length === 0 ? (
                 <p className="text-[11px] leading-relaxed text-muted">
                   {outputPickerSupported
-                    ? "Android/Chrome không hiện loa Bluetooth trong list — bấm “Chọn loa” để mở picker hệ thống."
-                    : "Trình duyệt không liệt kê loa. Âm thanh theo loa mặc định của máy (Media/BT trong cài đặt Android)."}
+                    ? "Điện thoại: để “Tự động” — Android tự gắn Bluetooth. Chỉ bấm “Chọn loa” nếu muốn chỉ định loa."
+                    : "Điện thoại: âm thanh theo Bluetooth hệ thống khi đã kết nối headset."}
                 </p>
               ) : null}
             </label>
