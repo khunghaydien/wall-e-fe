@@ -105,8 +105,8 @@ export default function Home() {
               {outputs.length === 0 ? (
                 <p className="text-[11px] leading-relaxed text-muted">
                   {outputPickerSupported
-                    ? "Điện thoại: kết nối loa BT trước, để Tự động, rồi Start. App dùng mic máy + loa BT (giống YouTube)."
-                    : "Điện thoại: kết nối loa Bluetooth ở hệ thống, để Tự động, rồi Start."}
+                    ? "Lúc nghe: mic Bluetooth. Lúc AI nói: tắt mic, phát loa Bluetooth."
+                    : "Lúc nghe dùng mic Bluetooth, lúc AI nói dùng loa Bluetooth."}
                 </p>
               ) : null}
             </label>

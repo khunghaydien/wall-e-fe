@@ -46,10 +46,9 @@ export type AudioRouteSelection = {
  * Mic audio is sent only while listening/thinking. While the assistant is
  * preparing or speaking there is no barge-in.
  *
- * Bluetooth:
- * - Desktop (Chrome/Edge Mac): auto-select BT mic + speaker by deviceId.
- * - Phone: leave mic/speaker on OS default — Android/iOS already route the
- *   connected headset; chasing deviceId + setSinkId remounts HFP and kicks BT.
+ * Bluetooth half-duplex:
+ * - Listening: Bluetooth mic (HFP/SCO)
+ * - Speaking: release mic so the OS returns to A2DP, then play Bluetooth speaker
  */
 export class RealtimeVoiceRuntime {
   readonly events = new EventBus<RuntimeEvents>();
@@ -78,6 +77,7 @@ export class RealtimeVoiceRuntime {
   private routing = false;
   private micRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private micRetryAttempt = 0;
+  private playbackReady: Promise<void> = Promise.resolve();
 
   getAudioDevices(): Promise<AudioDeviceLists> {
     return listAudioDevices();
@@ -102,27 +102,30 @@ export class RealtimeVoiceRuntime {
       this.setTts(TtsStatus.Connecting);
 
       const mobile = isMobileBrowser();
+      const playback = await this.speaker.preparePlayback();
+      this.mic.attachContext(playback);
       if (mobile) {
-        // YouTube path: hold STREAM_MUSIC / A2DP, then open the phone mic
-        // on the same AudioContext. A second context or AEC switches SCO.
-        const playback = await this.speaker.preparePlayback();
-        this.mic.attachContext(playback);
         await this.mediaHold.start();
-        await sleep(350);
-        await this.mic.start(undefined, { mobile: true });
+        await sleep(250);
       } else {
         await this.speaker.enqueue({
           pcm: new Int16Array(240),
           sampleRate: AUDIO_SAMPLE_RATE,
           timestamp: performance.now(),
         });
-        await this.mic.start(this.preferredInputId, { bluetooth: true });
       }
+
+      const { inputs } = await listAudioDevices();
+      const input = pickAutoInput(inputs, this.preferredInputId);
+      await this.mic.start(input?.deviceId, {
+        bluetooth: true,
+        mobile,
+      });
       await this.transport.connect();
 
-      await this.applyAudioRouting({ forceInput: !mobile });
-      if (!mobile) this.watchDeviceChanges();
-      if (!mobile) this.watchMicTrackEnded();
+      await this.applyAudioRouting({ forceInput: true });
+      this.watchDeviceChanges();
+      this.watchMicTrackEnded();
 
       this.setMic(MicStatus.Capturing);
       this.setLlm(LlmStatus.Idle);
@@ -201,6 +204,8 @@ export class RealtimeVoiceRuntime {
               thinking: true,
               message: "WALL-E đang nghe và suy nghĩ...",
             });
+            // Free HFP now so A2DP speaker is ready when TTS starts.
+            void this.releaseMicForPlayback();
             break;
           case "response_started":
             this.listenEpoch += 1;
@@ -213,19 +218,22 @@ export class RealtimeVoiceRuntime {
             this.setLlm(LlmStatus.Streaming);
             this.setTts(TtsStatus.Streaming);
             this.setSpeaking(SpeakingStatus.Buffering);
+            void this.releaseMicForPlayback();
             break;
           case "audio_end":
             if (
               !message.itemId ||
               message.itemId !== this.interruptedItemId
             ) {
-              this.speaker.pushStreamFrame({
-                pcm: new Int16Array(0),
-                sampleRate: AUDIO_SAMPLE_RATE,
-                phraseId: message.phraseId ?? 0,
-                frameIndex: Number.MAX_SAFE_INTEGER,
-                isLast: true,
-                turnId: message.turnId,
+              void this.playbackReady.then(() => {
+                this.speaker.pushStreamFrame({
+                  pcm: new Int16Array(0),
+                  sampleRate: AUDIO_SAMPLE_RATE,
+                  phraseId: message.phraseId ?? 0,
+                  frameIndex: Number.MAX_SAFE_INTEGER,
+                  isLast: true,
+                  turnId: message.turnId,
+                });
               });
             }
             break;
@@ -262,13 +270,15 @@ export class RealtimeVoiceRuntime {
         if (message.itemId) this.currentAssistantItemId = message.itemId;
         this.setSpeaking(SpeakingStatus.Buffering);
         this.setTts(TtsStatus.Streaming);
-        this.speaker.pushStreamFrame({
-          pcm: base64ToInt16(message.data),
-          sampleRate: message.sampleRate,
-          phraseId: message.phraseId ?? 0,
-          frameIndex: message.frameIndex ?? message.sequence,
-          isLast: message.isLast ?? false,
-          turnId: message.turnId,
+        void this.playbackReady.then(() => {
+          this.speaker.pushStreamFrame({
+            pcm: base64ToInt16(message.data),
+            sampleRate: message.sampleRate,
+            phraseId: message.phraseId ?? 0,
+            frameIndex: message.frameIndex ?? message.sequence,
+            isLast: message.isLast ?? false,
+            turnId: message.turnId,
+          });
         });
       },
       transcript: (message) => {
@@ -301,6 +311,7 @@ export class RealtimeVoiceRuntime {
     fromDeviceChange?: boolean;
   }): Promise<void> {
     if (this.routing || this.mic.isOpening) return;
+    if (this.mic.isPaused) return;
     this.routing = true;
     try {
       const { inputs, outputs } = await listAudioDevices();
@@ -320,55 +331,42 @@ export class RealtimeVoiceRuntime {
   }
 
   /**
-   * Phones: the OS already moves default mic/speaker onto Bluetooth when the
-   * headset connects. Remounting with a BT deviceId or setSinkId during that
-   * handshake is what drops the link on Android Chrome.
+   * Listening: Bluetooth mic. Speaking: mic is paused — do not remount.
    */
   private async applyMobileAudioRouting(
     inputs: AudioDeviceInfo[],
     outputs: AudioDeviceInfo[],
     opts: { forceInput: boolean; fromDeviceChange?: boolean },
   ): Promise<void> {
-    // Explicit user mic pick only (dropdown). Never auto-chase BT deviceIds.
-    if (this.preferredInputId) {
-      const preferred = findInputById(inputs, this.preferredInputId);
-      if (!preferred) {
-        if (!opts.fromDeviceChange) this.scheduleMicRetry();
-        this.emitAudioRoute(
-          findInputById(inputs, this.mic.activeDeviceId),
-          this.resolveMobileOutput(outputs),
-        );
-        return;
+    const targetInput = pickAutoInput(inputs, this.preferredInputId);
+    const output = pickAutoOutput(
+      outputs,
+      targetInput,
+      this.preferredOutputId,
+    );
+
+    if (targetInput) {
+      const bluetooth = isBluetoothLabel(targetInput.label);
+      if (this.mic.activeDeviceId !== targetInput.deviceId || !this.mic.isLive) {
+        if (!opts.fromDeviceChange || this.preferredInputId) {
+          await this.mic.setDevice(targetInput.deviceId, {
+            bluetooth,
+            mobile: true,
+          });
+          this.micRetryAttempt = 0;
+        }
       }
-      if (this.mic.activeDeviceId !== preferred.deviceId || !this.mic.isLive) {
-        await this.mic.setDevice(preferred.deviceId, {
-          bluetooth: isBluetoothLabel(preferred.label),
-          mobile: true,
-        });
-        this.micRetryAttempt = 0;
-      }
-    } else if (!this.mic.isLive) {
-      // Dead track only — remounting a live stream is what kicks BT on phones.
-      await this.mic.setDevice(undefined, { bluetooth: true, mobile: true });
-      this.micRetryAttempt = 0;
+    } else if (!this.mic.isLive && !opts.fromDeviceChange) {
+      this.scheduleMicRetry(true);
     }
 
-    const inputAfter = findInputById(inputs, this.mic.activeDeviceId);
-    const output = this.resolveMobileOutput(outputs);
-    // Never auto setSinkId on mobile — only when user picked via "Chọn loa".
     if (this.preferredOutputId) {
       await this.speaker.setOutputDevice(this.preferredOutputId);
     }
-    this.emitAudioRoute(inputAfter, output);
-  }
-
-  private resolveMobileOutput(
-    outputs: AudioDeviceInfo[],
-  ): AudioDeviceInfo | undefined {
-    if (this.preferredOutputId) {
-      return outputs.find((d) => d.deviceId === this.preferredOutputId);
-    }
-    return outputs.find((d) => isBluetoothLabel(d.label));
+    this.emitAudioRoute(
+      findInputById(inputs, this.mic.activeDeviceId) ?? targetInput,
+      output,
+    );
   }
 
   private async applyDesktopAudioRouting(
@@ -416,8 +414,8 @@ export class RealtimeVoiceRuntime {
 
   private watchMicTrackEnded(): void {
     this.mic.onTrackEnded(() => {
-      if (!this.started) return;
-      // Mobile: OS flaps tracks during HFP — wait longer, remount default only.
+      if (!this.started || this.mic.isPaused) return;
+      if (this.gate !== "listening" && this.gate !== "thinking") return;
       if (isMobileBrowser()) {
         this.scheduleMicRetry(true);
         return;
@@ -471,9 +469,7 @@ export class RealtimeVoiceRuntime {
       const mobile = isMobileBrowser();
       timer = setTimeout(() => {
         timer = null;
-        if (!this.started || this.mic.isOpening) return;
-        // Mobile: never force remount on devicechange — only refresh labels /
-        // recover a dead track. Desktop still auto-chases Bluetooth.
+        if (!this.started || this.mic.isOpening || this.mic.isPaused) return;
         void this.applyAudioRouting({
           forceInput: !mobile,
           fromDeviceChange: true,
@@ -508,6 +504,26 @@ export class RealtimeVoiceRuntime {
     }
   }
 
+  /**
+   * Drop the Bluetooth mic so the headset can switch back to A2DP speaker.
+   */
+  private releaseMicForPlayback(): Promise<void> {
+    if (this.mic.isPaused) return this.playbackReady;
+    this.playbackReady = (async () => {
+      await this.mic.pause();
+      this.setMic(MicStatus.Idle);
+      this.emitMicLevel(0);
+      await sleep(isMobileBrowser() ? 800 : 450);
+    })();
+    return this.playbackReady;
+  }
+
+  private async acquireMicForListening(): Promise<void> {
+    await this.mic.resume();
+    this.setMic(MicStatus.Capturing);
+    await this.applyAudioRouting({ forceInput: false });
+  }
+
   private maybeResumeListening(): void {
     if (!this.responseDone || this.speaker.isPlaying || this.userSpeaking) return;
     if (this.gate === "listening" || this.gate === "thinking") return;
@@ -515,11 +531,16 @@ export class RealtimeVoiceRuntime {
     const epoch = ++this.listenEpoch;
     this.setGate("echo_hold");
     this.emitMicLevel(0);
+    const wait = isMobileBrowser() ? 700 : ECHO_SETTLE_MS;
     setTimeout(() => {
-      if (!this.started || epoch !== this.listenEpoch) return;
-      this.transport.listenResume();
-      this.returnToListening();
-    }, ECHO_SETTLE_MS);
+      void (async () => {
+        if (!this.started || epoch !== this.listenEpoch) return;
+        await this.acquireMicForListening();
+        if (!this.started || epoch !== this.listenEpoch) return;
+        this.transport.listenResume();
+        this.returnToListening();
+      })();
+    }, wait);
   }
 
   private returnToListening(): void {

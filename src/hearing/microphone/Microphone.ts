@@ -35,6 +35,8 @@ export class Microphone {
   private deviceId: string | undefined;
   private bluetoothMode = false;
   private mobileMode = false;
+  private lastCapture: OpenCaptureOptions = {};
+  private paused = false;
   private started = false;
   private opening = false;
   private openGeneration = 0;
@@ -61,6 +63,28 @@ export class Microphone {
   get activeDeviceId(): string | undefined {
     const track = this.stream?.getAudioTracks()[0];
     return track?.getSettings().deviceId ?? this.deviceId;
+  }
+
+  get isPaused(): boolean {
+    return this.paused;
+  }
+
+  /**
+   * Release the capture track without ending the session.
+   * Bluetooth can leave HFP/SCO so A2DP speaker playback works.
+   */
+  async pause(): Promise<void> {
+    if (!this.started || this.paused) return;
+    this.paused = true;
+    this.openGeneration += 1;
+    await this.closeCapture();
+  }
+
+  /** Re-open capture after pause (listening turn). */
+  async resume(): Promise<void> {
+    if (!this.started || !this.paused) return;
+    this.paused = false;
+    await this.openCapture(this.deviceId, this.lastCapture);
   }
 
   get isOpening(): boolean {
@@ -90,7 +114,7 @@ export class Microphone {
     capture: OpenCaptureOptions = {},
   ): Promise<void> {
     this.deviceId = deviceId;
-    if (!this.started) return;
+    if (!this.started || this.paused) return;
 
     if (this.isLive && !this.opening) {
       if (!deviceId) return;
@@ -112,6 +136,8 @@ export class Microphone {
   ): Promise<void> {
     const generation = ++this.openGeneration;
     this.opening = true;
+    this.paused = false;
+    this.lastCapture = capture;
     this.mobileMode = Boolean(capture.mobile);
     this.bluetoothMode = Boolean(capture.bluetooth || capture.mobile);
 
